@@ -2,6 +2,12 @@
 
 A lightweight HUD for analyzing global-cooldown timing, input queue use, late presses, server-delay symptoms, and recorded cast-failure causes.
 
+## Preview
+
+![GCD Optimizer timing HUD](https://media.forgecdn.net/attachments/1510/156/screenshot-2026-02-02-054015-png.png)
+
+Screenshot from the [CurseForge gallery](https://www.curseforge.com/wow/addons/gcd-optimizer).
+
 ## Installation
 
 Copy the `GCDOptimizer` directory into `World of Warcraft/_retail_/Interface/AddOns/`, then restart the client or use `/reload`. Its optional LibStub, callback, data-broker, and minimap-button dependencies are bundled in `libs/`.
@@ -29,3 +35,7 @@ No older project tracker was present. The repository now records its release-rea
 - [Architecture](ARCHITECTURE.md)
 - [Code index](CODE_INDEX.md)
 - [Code graph](CODE_GRAPH.md)
+
+## License
+
+Licensed under the [MIT License](LICENSE). Bundled third-party components remain under their own notices.
