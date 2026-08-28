@@ -1,10 +1,12 @@
 -- GCDOptimizer_Util.lua
--- Small utilities: clamp, deque, stats helpers
+-- Shared helpers, bounded deque, statistics, and the Secret-safe cooldown boundary.
 
 local _, NS = ...
 
 NS.Util = NS.Util or {}
 local U = NS.Util
+
+U.GCD_SPELL_ID = 61304
 
 function U.Clamp(x, lo, hi)
   if x < lo then return lo end
@@ -12,18 +14,79 @@ function U.Clamp(x, lo, hi)
   return x
 end
 
+-- Test accessibility before any branch, comparison, arithmetic, formatting,
+-- indexing, or persistence of a value returned by a Secret-capable API.
+function U.CanAccessValues(...)
+  if type(canaccessallvalues) == "function" then
+    return canaccessallvalues(...)
+  end
+
+  local count = select("#", ...)
+  if type(canaccessvalue) == "function" then
+    for i = 1, count do
+      if not canaccessvalue(select(i, ...)) then
+        return false
+      end
+    end
+    return true
+  end
+
+  if type(issecretvalue) == "function" then
+    for i = 1, count do
+      if issecretvalue(select(i, ...)) then
+        return false
+      end
+    end
+  end
+
+  return true
+end
+
+-- Returns ordinary numeric startTime/duration values only. Inaccessible,
+-- missing, inactive, and malformed cooldowns all collapse to nil, nil.
+function U.ReadSpellCooldown(spellID)
+  if type(spellID) ~= "number" or spellID <= 0 then
+    return nil, nil
+  end
+  if type(C_Spell) ~= "table" or type(C_Spell.GetSpellCooldown) ~= "function" then
+    return nil, nil
+  end
+
+  local info = C_Spell.GetSpellCooldown(spellID)
+  if not U.CanAccessValues(info) then
+    return nil, nil
+  end
+  if type(info) ~= "table" then
+    return nil, nil
+  end
+
+  local startTime = info.startTime
+  local duration = info.duration
+  if not U.CanAccessValues(startTime, duration) then
+    return nil, nil
+  end
+  if type(startTime) ~= "number" or type(duration) ~= "number" then
+    return nil, nil
+  end
+  if startTime <= 0 or duration <= 0 then
+    return nil, nil
+  end
+
+  return startTime, duration
+end
+
+function U.ReadGCDCooldown()
+  return U.ReadSpellCooldown(U.GCD_SPELL_ID)
+end
+
 -- ----------------------------
 -- Deque (array + head index)
--- pushBack, popFrontWhile, iterate
 -- ----------------------------
 U.Deque = {}
 U.Deque.__index = U.Deque
 
--- Compact internal storage occasionally to avoid unbounded growth of array indices.
--- This is important for long sessions where we popFront frequently (sliding windows).
 function U.Deque:MaybeCompact()
   local head, tail = self.head, self.tail
-  -- Only consider compacting when head advanced far.
   if head <= 1024 then return end
 
   local size = tail - head + 1
@@ -34,8 +97,6 @@ function U.Deque:MaybeCompact()
     return
   end
 
-  -- Compact when the "wasted" prefix is much larger than the live size.
-  -- This keeps indices small and reduces GC pressure.
   if head > (size * 2) then
     local new = {}
     local j = 1
@@ -54,13 +115,13 @@ function U.Deque:New()
 end
 
 function U.Deque:Size()
-  return (self.tail - self.head + 1)
+  return self.tail - self.head + 1
 end
 
 function U.Deque:PushBack(v)
-  local t = self.tail + 1
-  self.tail = t
-  self.data[t] = v
+  local tail = self.tail + 1
+  self.tail = tail
+  self.data[tail] = v
 end
 
 function U.Deque:Front()
@@ -70,18 +131,17 @@ end
 
 function U.Deque:PopFront()
   if self.head > self.tail then return nil end
-  local v = self.data[self.head]
+  local value = self.data[self.head]
   self.data[self.head] = nil
   self.head = self.head + 1
   self:MaybeCompact()
-  return v
+  return value
 end
 
-function U.Deque:PopFrontWhile(pred)
+function U.Deque:PopFrontWhile(predicate)
   while true do
-    local v = self:Front()
-    if not v then return end
-    if not pred(v) then return end
+    local value = self:Front()
+    if value == nil or not predicate(value) then return end
     self:PopFront()
   end
 end
@@ -97,40 +157,38 @@ function U.Deque:Iter()
 end
 
 -- ----------------------------
--- Stats: mean / median / percentile
--- (for small N like 20-100; copy+sort is fine)
+-- Statistics for small samples
 -- ----------------------------
-local function copyAndSort(arr)
-  local tmp = {}
-  for i = 1, #arr do tmp[i] = arr[i] end
-  table.sort(tmp)
-  return tmp
+local function CopyAndSort(values)
+  local copy = {}
+  for i = 1, #values do copy[i] = values[i] end
+  table.sort(copy)
+  return copy
 end
 
-function U.Mean(arr)
-  local n = #arr
-  if n == 0 then return 0 end
-  local s = 0
-  for i = 1, n do s = s + arr[i] end
-  return s / n
+function U.Mean(values)
+  local count = #values
+  if count == 0 then return 0 end
+  local total = 0
+  for i = 1, count do total = total + values[i] end
+  return total / count
 end
 
-function U.Median(arr)
-  local n = #arr
-  if n == 0 then return 0 end
-  local s = copyAndSort(arr)
-  local mid = math.floor((n + 1) / 2)
-  if (n % 2) == 1 then
-    return s[mid]
-  else
-    return (s[mid] + s[mid + 1]) / 2
+function U.Median(values)
+  local count = #values
+  if count == 0 then return 0 end
+  local sorted = CopyAndSort(values)
+  local mid = math.floor((count + 1) / 2)
+  if (count % 2) == 1 then
+    return sorted[mid]
   end
+  return (sorted[mid] + sorted[mid + 1]) / 2
 end
 
-function U.Percentile(arr, p) -- p in [0,1]
-  local n = #arr
-  if n == 0 then return 0 end
-  local s = copyAndSort(arr)
-  local idx = math.floor(U.Clamp(p, 0, 1) * (n - 1) + 1)
-  return s[idx]
+function U.Percentile(values, percentile)
+  local count = #values
+  if count == 0 then return 0 end
+  local sorted = CopyAndSort(values)
+  local index = math.floor(U.Clamp(percentile, 0, 1) * (count - 1) + 1)
+  return sorted[index]
 end

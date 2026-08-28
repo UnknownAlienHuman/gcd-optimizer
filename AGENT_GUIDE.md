@@ -1,52 +1,98 @@
-# Agent guide: GCDOptimizer
+# Agent guide: GCD Optimizer
 
-## Start here
+## Current contract
 
-[`GCDOptimizer.toc`](GCDOptimizer.toc) is the load-order contract: vendored LibStub/CallbackHandler/LibDataBroker/LibDBIcon, utility/locale, estimator, core, press/integration, metrics, detector, anchors/failures, then HUD/options/minimap/test. `GCDOptimizer_Core.lua:NS:Init` is the bootstrap; its event frame handles `ADDON_LOADED`, `PLAYER_LOGIN`, `PLAYER_REGEN_DISABLED`, and `PLAYER_REGEN_ENABLED`.
+Target Retail `12.1.0`, Interface `120100`, addon version `0.5.0-midnight-12.1`. The pinned engineering baseline is Blizzard build `12.1.0.69497`, source commit `027d26c3406d3de2cbd2b1f67d468fe033a1bcd4`, reviewed 2026-08-27.
+
+Read the project knowledge base before changing code:
+
+- [wow-addon-engineering-kb](https://github.com/UnknownAlienHuman/wow-addon-engineering-kb)
+- `KB/addon/Patch_12_1_0_Addon_Changes.md`
+- `KB/core/BlizzardUI_security.md`
+- `KB/core/BlizzardUI_Performance_Modules.md`
+- `KB/deep/Spell_Secrecy_Registry_12_1_0.md`
+
+## Load order and bootstrap
+
+`GCDOptimizer.toc` loads libraries, utilities/locales, runtime modules, UI adapters, and finally `GCDOptimizer_Core.lua`. Core owns:
+
+- SavedVariables/default migration;
+- module initialization;
+- segment start, pause, reset, and combat automation;
+- HUD visibility;
+- the only `/gcdopt` registration.
+
+`GCDOptimizer_Test.lua` is intentionally absent from the production TOC and uses `/gcdopttest` when manually enabled.
 
 ## Runtime map
 
-- `GCDOptimizer_Core.lua:NS:GetConfig` owns `GCDOptimizerDB`, defaults, and version reset. `NS.state` owns segment lifecycle (`inSegment`, start/end, effective end, auto-combat); all submodules are called through `SafeCall` in `NS:StartSegment`, `PauseSegment`, `ResetSegment`, and `ResetAndContinue`.
-- `GCDOptimizer_PressTracker.lua` installs input/action/cast hooks and sends normalized presses to `NS.Metrics:OnPress` only while a segment is active.
-- `GCDOptimizer_GCDDetector.lua` observes player successful casts and samples the GCD spell (`61304`) with a ticker; `GCDOptimizer_GCDEstimator.lua` combines observations and cast successes into predicted/observed GCD values.
-- `GCDOptimizer_Integrator.lua` samples predicted GCD/possible fight windows; `GCDOptimizer_Metrics.lua` owns timing aggregates (queue lead, late press, waste, AFK, lost GCD, APM, gaps).
-- `GCDOptimizer_Anchors.lua` correlates activation overlays and spellcast sent/succeeded/failed/interrupted events; `GCDOptimizer_Failures.lua` records `UI_ERROR_MESSAGE`, player cast failures, and optional combat-log diagnostics.
-- `GCDOptimizer_HUD.lua` renders the current/final metric snapshot and runs a ticker while visible. Options and minimap are UI/config adapters. The `/gcdopt` handler is assigned in `GCDOptimizer_Core.lua:349-390`, reassigned by `GCDOptimizer_Minimap.lua:105-135`, and reassigned a third time by the last-loaded `GCDOptimizer_Test.lua:108-120`; the final handler currently exposes only `test`, `debug`, and `anchors`, so the production `start`/`stop`/`reset`/`show`/`hide` commands are shadowed until load order or registration is fixed. Track the unification in [GitHub issue #2](https://github.com/UnknownAlienHuman/gcd-optimizer/issues/2).
+- `GCDOptimizer_Util.lua`: accessibility predicates, the centralized `C_Spell.GetSpellCooldown` boundary, deque, and statistics.
+- `GCDOptimizer_GCDEstimator.lua`: last accessible GCD duration and session fallback; no unit-stat or swing-speed inference.
+- `GCDOptimizer_GCDDetector.lua`: segment-only polling of spell `61304`; cast success schedules a read but never proves a GCD.
+- `GCDOptimizer_PressTracker.lua`: secure hooks with zero-argument callbacks; only local timestamps enter metrics.
+- `GCDOptimizer_Metrics.lua`: queue, late, idle, waste, lost-GCD, and SQW analysis.
+- `GCDOptimizer_Integrator.lua`: piecewise predicted-GCD integration.
+- `GCDOptimizer_Failures.lua`: payload-free player cast-failure timestamps; public reason is generic `OTH`.
+- `GCDOptimizer_Anchors.lua`: bounded, optional overlay show/hide diagnostics with accessibility-gated spell IDs.
+- `GCDOptimizer_HUD.lua`: rendering and analysis; do not move combat-data reads into the HUD.
+- `GCDOptimizer_Options.lua`: language panel only.
+- `GCDOptimizer_Minimap.lua`: LDB/DBIcon adapter; no slash registration.
 
-## State and dependencies
+## Security invariants
 
-`GCDOptimizerDB` stores configuration, HUD visibility/position, anchors, and minimap settings. Timing samples, segment counters, recent cast/overlay rings, detector state, and failure windows are transient module tables. `LibStub`, `CallbackHandler-1.0`, `LibDataBroker-1.1`, and `LibDBIcon-1.0` are vendored; TOC marks them `OptionalDeps` for compatibility with already-loaded copies. `libs/LibDBIcon-1.0/lib.xml` is present but inactive because the root TOC loads the library Lua file directly. No in-house addon is required.
+1. Gate Secret-capable values before branch, comparison, arithmetic, formatting, concatenation, indexing, iteration, logging, persistence, or forwarding.
+2. `issecretvalue` describes provenance; use `canaccessvalue`/`canaccessallvalues` for the use boundary.
+3. `pcall` is not declassification.
+4. Do not add combat-log, raw aura, UI-error-text, focus/layout, or forbidden-object inference paths.
+5. Do not retain action, spell, macro, item, target, cast-GUID, or error payloads merely because one build currently exposes them.
+6. Do not replace Blizzard globals or monkey-patch secure APIs.
+7. If `61304` becomes inaccessible, fail closed. Do not reconstruct the hidden duration from another restricted statistic.
+
+## Lifecycle invariants
+
+- `NS.state.inSegment` gates all timing writes.
+- Detector/HUD tickers must be cancelled on reset/end and must not multiply after `/reload` or repeated starts.
+- `GCDDetector:Init()` must run before `OnSegmentStart()`.
+- Metrics and Integrator must start before Detector's first poll can emit `NS:OnGCDStart`.
+- A pre-existing cooldown is primed but not counted for manual starts; the first auto-combat GCD may reanchor Metrics and Integrator by at most two seconds.
+- Entering combat replaces a running manual segment only when combat autostart is enabled.
+- Auto-stop applies only to an auto-started combat segment.
+- Reset preserves the current running/auto state through `ResetAndContinue`.
+
+## SavedVariables
+
+`GCDOptimizerDB` is migrated by `__schemaVersion`, not erased on every release string change. Additive defaults belong in `GCDOptimizer_Core.lua:DEFAULTS`. Any incompatible schema change requires an explicit, reviewable migration.
+
+Never store transient timing samples or restricted payloads in SavedVariables.
 
 ## Change routing
 
-- Change configuration/version migration: `GCDOptimizer_Core.lua:DEFAULTS` and `NS:GetConfig`; update `GCDOptimizer_Options.lua` only for controls.
-- Change segment start/stop/reset or combat auto mode: `GCDOptimizer_Core.lua:NS:StartSegment`, `PauseSegment`, `ResetSegment`, `OnCombatStart`, `OnCombatEnd`.
-- Change press classification or source hooks: `GCDOptimizer_PressTracker.lua` and `GCDOptimizer_Integrator.lua`; keep `NS.Metrics:OnPress` as the single metric ingress.
-- Change GCD observations/prediction: `GCDOptimizer_GCDDetector.lua` and `GCDOptimizer_GCDEstimator.lua`; do not recompute in HUD.
-- Change accounting formulas: `GCDOptimizer_Metrics.lua`; update HUD labels/tests with any field-name change.
-- Change failure taxonomy: `GCDOptimizer_Failures.lua`; keep failure diagnostics separate from timing aggregates.
-- Change presentation/refresh cadence: `GCDOptimizer_HUD.lua`; keep ticker stopped when hidden or segment-ended.
-- Change placement or minimap: `GCDOptimizer_Anchors.lua`/`GCDOptimizer_Minimap.lua`; preserve DB anchor schema.
+- API/accessibility boundary: `GCDOptimizer_Util.lua`.
+- GCD source or de-duplication: `GCDOptimizer_GCDDetector.lua` and `GCDOptimizer_GCDEstimator.lua`.
+- Input sources: `GCDOptimizer_PressTracker.lua`; callbacks must remain payload-free.
+- Accounting formulas: `GCDOptimizer_Metrics.lua`; update labels and test evidence together.
+- Segment/combat behavior or commands: `GCDOptimizer_Core.lua`.
+- Failure evidence: `GCDOptimizer_Failures.lua`; do not recover removed reason inference without a current contract.
+- Presentation: `GCDOptimizer_HUD.lua`; keep data collection outside render code.
+- Launcher/settings: `GCDOptimizer_Minimap.lua` and `GCDOptimizer_Options.lua`.
 
-## Invariants/risks
-
-- `NS.state.inSegment` gates all timing writes; starting twice must not duplicate resets, and ending must set `segmentEndEffective` consistently.
-- Timing is sensitive to event ordering and clock resolution. Preserve monotonic timestamps, the detector's minimum delta/drift thresholds, and anchor ring bounds.
-- `COMBAT_LOG_EVENT_UNFILTERED`, cast/GCD APIs, and activation overlays may be restricted or secret in Midnight. `Failures` and `Anchors` must fail closed without arithmetic on unreadable values.
-- HUD ticker and detector/metrics tickers are hot paths. Avoid per-tick allocations and stop timers on segment end; no protected action is performed by this addon.
-- SavedVariables version reset is intentional (`__addonVersion`); do not silently change the schema without migration/reset policy.
-
-## Verification
-
-Static checks:
+## Static verification
 
 ```powershell
-Get-Content _Addons/GCDOptimizer/GCDOptimizer.toc
-rg -n "GCDOptimizerDB|NS:StartSegment|Metrics:OnPress|GCDDetector|GCDEstimator|SlashCmdList|COMBAT_LOG" _Addons/GCDOptimizer
+rg -n "^## Interface|^## Version" GCDOptimizer.toc
+rg -n "SLASH_GCDOPT1|SlashCmdList[.\[]GCDOPT" .
+rg -n "DoesSpellTriggerGlobalCooldown|GetMouseFocus|COMBAT_LOG_EVENT_UNFILTERED|UI_ERROR_MESSAGE" .
+rg -n "UnitAttackSpeed|UnitSpellHaste|RunMacroText" GCDOptimizer_*.lua
+rg -n "GCDOptimizer_Test.lua" GCDOptimizer.toc
 ```
 
-In-game: first verify the current final slash surface with `/gcdopt test`, `/gcdopt debug`, and `/gcdopt anchors`; the production handler in `Core.lua`/`Minimap.lua` is currently shadowed by `GCDOptimizer_Test.lua`. Then test the underlying segment lifecycle through its UI/controlled calls (`start`, `stop`, `reset`, `show`, `hide`), auto combat start/stop, normal/queued/late presses, spell queue window changes, cast failures, reload persistence, HUD drag/anchors, and restricted-value builds. Compare HUD totals with the debug/test panel and inspect client errors after a long combat segment.
+Expected results:
 
-## Unknowns
+- Interface `120100` and version `0.5.0-midnight-12.1`;
+- exactly one production `/gcdopt` registration, in Core;
+- no obsolete API or restricted inference matches in runtime files;
+- no test harness in the TOC.
 
-Static review cannot prove the accuracy of timing against the current server queue window or every class/build's GCD behavior. Treat measured calibration and target-client event availability as live-test evidence, not code-truth assumptions.
+## Live verification
+
+Follow [todo.md](todo.md) and GitHub issue #1. Static review cannot establish current hotfixed secrecy policy, real client event ordering, or class-specific accuracy. Record build/context and preserve failures as evidence rather than guessing.

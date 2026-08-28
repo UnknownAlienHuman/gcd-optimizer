@@ -1,40 +1,82 @@
 # GCD Optimizer
 
-A lightweight HUD for analyzing global-cooldown timing, input queue use, late presses, server-delay symptoms, and recorded cast-failure causes.
-
-## Preview
+GCD Optimizer is a lightweight World of Warcraft HUD for reviewing global-cooldown cadence, queue-window coverage, late input, idle gaps, and server-delay symptoms.
 
 ![GCD Optimizer timing HUD](https://media.forgecdn.net/attachments/1510/156/screenshot-2026-02-02-054015-png.png)
 
 Screenshot from the [CurseForge gallery](https://www.curseforge.com/wow/addons/gcd-optimizer).
 
+## Current release
+
+- Game: Retail 12.1.0
+- Interface: `120100`
+- Addon version: `0.5.0-midnight-12.1`
+- Author: Neomorph
+- Saved variables: `GCDOptimizerDB`
+- Engineering baseline: Blizzard UI source `12.1.0.69497`, commit `027d26c3406d3de2cbd2b1f67d468fe033a1bcd4`, reviewed 2026-08-27
+
 ## Installation
 
-Copy the `GCDOptimizer` directory into `World of Warcraft/_retail_/Interface/AddOns/`, then restart the client or use `/reload`. Its optional LibStub, callback, data-broker, and minimap-button dependencies are bundled in `libs/`.
+Copy the `GCDOptimizer` directory into:
 
-## Compatibility and data
+```text
+World of Warcraft/_retail_/Interface/AddOns/
+```
 
-- Interface: `120001`, `120000`
-- Version: `0.4.9-midnight-v2`
-- Saved variables: `GCDOptimizerDB`
+Restart the client or run `/reload`. LibStub, CallbackHandler, LibDataBroker, and LibDBIcon are bundled under `libs/`.
 
-## Usage
+## Controls
 
-The HUD exposes timing and metrics views. Its in-addon menu can start, stop, reset, hide, and configure the view; the detailed workflow and language notes are in [README_MIDNIGHT.md](README_MIDNIGHT.md).
+- Left-click the minimap icon: show or hide the HUD.
+- Right-click the minimap icon: start or stop a manual segment.
+- Shift-right-click the minimap icon: reset the current segment while preserving its running state.
+- Right-click the HUD: open its runtime menu.
 
-## Development status
+The single slash-command dispatcher supports:
 
-No older project tracker was present. The repository now records its release-readiness checks in [todo.md](todo.md); the current source should still be checked in-game on the target client before a release.
+```text
+/gcdopt
+/gcdopt show
+/gcdopt hide
+/gcdopt start
+/gcdopt stop
+/gcdopt reset
+/gcdopt minimap show
+/gcdopt minimap hide
+/gcdopt debug
+/gcdopt anchors
+/gcdopt help
+```
 
-## Published addon
+## Retail 12.1 data model
 
-[CurseForge: GCD Optimizer](https://www.curseforge.com/wow/addons/gcd-optimizer)
+The addon reads the GCD dummy spell (`61304`) only through a centralized accessibility gate. A successful player cast requests an immediate cooldown read but is not itself counted as a new GCD; this prevents off-GCD abilities from inflating the sample.
 
-## Developer documentation
+Input hooks discard all arguments and retain only ordinary local timestamps. The addon does not persist spell IDs, spell names, macro text, targets, cast GUIDs, or other protected input payloads in metrics state.
+
+When the GCD cooldown is inaccessible, timing detection fails closed and the HUD retains only the last ordinary duration observed in the current session. No alternate combat API is used to reconstruct hidden state.
+
+Failure diagnostics count player cast failures without parsing `UI_ERROR_MESSAGE`, combat-log data, targets, resources, or restricted text. In 12.1 the displayed reason is therefore intentionally generic unless Blizzard exposes a safe source in a future contract.
+
+## Saved-variable upgrades
+
+Version updates now merge compatible defaults into `GCDOptimizerDB` instead of erasing user settings whenever the release string changes. Destructive changes, if ever required, are owned by an explicit schema migration.
+
+## Development and verification
 
 - [Architecture](ARCHITECTURE.md)
 - [Code index](CODE_INDEX.md)
 - [Code graph](CODE_GRAPH.md)
+- [Retail 12.1 implementation notes](README_MIDNIGHT.md)
+- [Changelog](CHANGELOG.md)
+- [Release checklist](todo.md)
+- [WoW addon engineering knowledge base](https://github.com/UnknownAlienHuman/wow-addon-engineering-kb)
+
+Static source validation is part of this repository update. A current-client combat smoke test remains mandatory before publishing a packaged release; it is tracked in GitHub issue #1.
+
+## Published addon
+
+[CurseForge: GCD Optimizer](https://www.curseforge.com/wow/addons/gcd-optimizer)
 
 ## License
 

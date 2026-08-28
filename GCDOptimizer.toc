@@ -1,23 +1,22 @@
-## Interface: 120001,120000
+## Interface: 120100
 ## Title: GCD Optimizer
-## Notes: GCD timing / press analysis (queue/late/server delay)
+## Notes: GCD timing / press analysis (queue, late input, and server-delay symptoms)
 ## Author: Neomorph
-## Version: 0.4.9-midnight-v2
+## Version: 0.5.0-midnight-12.1
 ## SavedVariables: GCDOptimizerDB
 ## OptionalDeps: LibStub, CallbackHandler-1.0, LibDataBroker-1.1, LibDBIcon-1.0
-## IconTexture: Interface\\Icons\\INV_Misc_PocketWatch_02
+## IconTexture: Interface\Icons\INV_Misc_PocketWatch_02
 
-# Embedded libraries 
+# Embedded libraries
 libs\LibStub\LibStub.lua
 libs\CallbackHandler-1.0\CallbackHandler-1.0.lua
 libs\LibDataBroker-1.1\LibDataBroker-1.1.lua
 libs\LibDBIcon-1.0\LibDBIcon-1.0.lua
 
-# Addon files
+# Runtime modules
 GCDOptimizer_Util.lua
 GCDOptimizer_Locale.lua
 GCDOptimizer_GCDEstimator.lua
-GCDOptimizer_Core.lua
 GCDOptimizer_PressTracker.lua
 GCDOptimizer_Integrator.lua
 GCDOptimizer_Metrics.lua
@@ -27,4 +26,6 @@ GCDOptimizer_Failures.lua
 GCDOptimizer_HUD.lua
 GCDOptimizer_Options.lua
 GCDOptimizer_Minimap.lua
-GCDOptimizer_Test.lua
+GCDOptimizer_Core.lua
+
+# GCDOptimizer_Test.lua is a developer-only harness and is intentionally not loaded.

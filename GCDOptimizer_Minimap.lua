@@ -1,142 +1,88 @@
 -- GCDOptimizer_Minimap.lua
--- Minimap launcher using LibDataBroker + LibDBIcon-1.0 (required by button organizers)
+-- LibDataBroker / LibDBIcon launcher. Slash commands are owned exclusively by
+-- GCDOptimizer_Core.lua.
 
 local _, NS = ...
-GCDOptimizerDB = GCDOptimizerDB or {}
+
+NS.Minimap = NS.Minimap or {}
+local M = NS.Minimap
 
 local function EnsureDB()
-  GCDOptimizerDB.minimap = GCDOptimizerDB.minimap or { hide = false }
-  return GCDOptimizerDB.minimap
-end
-
-local function EnsureHUD()
-  if NS.HUD and NS.HUD.frame then return end
-  if NS.HUD and NS.HUD.Init then NS.HUD:Init() end
+  local cfg = NS:GetConfig()
+  if type(cfg.minimap) ~= "table" then cfg.minimap = { hide = false } end
+  if cfg.minimap.hide == nil then cfg.minimap.hide = false end
+  return cfg.minimap
 end
 
 local function ToggleHUD()
-  EnsureHUD()
   local cfg = NS:GetConfig()
-  cfg.showHUD = not cfg.showHUD
-  local f = NS.HUD and NS.HUD.frame
-  if not f then return end
-  f:SetShown(cfg.showHUD)
-  if cfg.showHUD then
-    if NS.HUD.StartTicker then NS.HUD:StartTicker() end
-    if NS.HUD.Update then NS.HUD:Update(true) end
-  else
-    if NS.HUD.StopTicker then NS.HUD:StopTicker() end
-    if NS.HUD.detailsFrame then NS.HUD.detailsFrame:Hide() end
-  end
+  NS:SetHUDShown(not cfg.showHUD)
 end
 
 local function ToggleSegment()
   local now = GetTime()
   if NS.state and NS.state.inSegment then
+    NS.state.autoCombat = false
     NS:PauseSegment(now)
   else
+    NS.state.autoCombat = false
     NS:StartSegment(now)
   end
-  if NS.HUD and NS.HUD.Update then NS.HUD:Update() end
+  if NS.HUD and NS.HUD.Update then NS.HUD:Update(true) end
 end
 
 local function ResetSegment()
-  NS:ResetSegment(GetTime())
-  if NS.HUD and NS.HUD.Update then NS.HUD:Update() end
+  NS:ResetAndContinue(GetTime())
+  if NS.HUD and NS.HUD.Update then NS.HUD:Update(true) end
 end
 
-local function TooltipLines()
-  local inSeg = NS.state and NS.state.inSegment
-  local paused = NS.state and NS.state.manualPaused
-  local status = inSeg and "RUNNING" or (paused and "PAUSED" or "IDLE")
-  return {
-    "GCD Optimizer",
-    "Status: " .. status,
-    " ",
-    "Left Click: Toggle window",
-    "Right Click: Start/Stop tracking",
-    "Shift+Right Click: Reset",
-  }
+function M:SetIconShown(shown)
+  local db = EnsureDB()
+  db.hide = not shown
+  if not self.icon then return end
+  if shown then
+    self.icon:Show("GCDOptimizer")
+  else
+    self.icon:Hide("GCDOptimizer")
+  end
 end
 
-local function InitLDB()
+function M:Init()
+  if self._inited then return end
+  self._inited = true
+
   if not LibStub then return end
   local ldb = LibStub:GetLibrary("LibDataBroker-1.1", true)
-  if not ldb then return end
+  local icon = LibStub:GetLibrary("LibDBIcon-1.0", true)
+  if not (ldb and icon) then return end
 
-  local obj = ldb:NewDataObject("GCDOptimizer", {
+  local object = ldb:NewDataObject("GCDOptimizer", {
     type = "launcher",
-    text = "GCDOptimizer",
+    text = "GCD Optimizer",
     icon = "Interface\\Icons\\INV_Misc_PocketWatch_01",
     OnClick = function(_, button)
       if button == "LeftButton" then
         ToggleHUD()
       elseif button == "RightButton" then
-        if IsShiftKeyDown() then
-          ResetSegment()
-        else
-          ToggleSegment()
-        end
+        if IsShiftKeyDown() then ResetSegment() else ToggleSegment() end
       end
     end,
-    OnTooltipShow = function(tt)
-      local lines = TooltipLines()
-      tt:AddLine(lines[1], 1, 1, 1)
-      for i = 2, #lines do
-        tt:AddLine(lines[i], 0.9, 0.9, 0.9, true)
-      end
+    OnTooltipShow = function(tooltip)
+      local running = NS.state and NS.state.inSegment
+      local paused = NS.state and NS.state.manualPaused
+      local status = running and "RUNNING" or (paused and "PAUSED" or "IDLE")
+      tooltip:AddLine("GCD Optimizer", 1, 1, 1)
+      tooltip:AddLine("Status: " .. status, 0.9, 0.9, 0.9)
+      tooltip:AddLine(" ")
+      tooltip:AddLine("Left Click: Toggle window", 0.9, 0.9, 0.9)
+      tooltip:AddLine("Right Click: Start/Stop tracking", 0.9, 0.9, 0.9)
+      tooltip:AddLine("Shift+Right Click: Reset", 0.9, 0.9, 0.9)
     end,
   })
 
-  local icon = LibStub:GetLibrary("LibDBIcon-1.0", true)
-  if not icon then return end
-
-  icon:Register("GCDOptimizer", obj, EnsureDB())
-  if EnsureDB().hide then
-    icon:Hide("GCDOptimizer")
-  else
-    icon:Show("GCDOptimizer")
-  end
-
-  NS.minimapLDB = obj
+  self.object = object
+  self.icon = icon
+  icon:Register("GCDOptimizer", object, EnsureDB())
+  self:SetIconShown(not EnsureDB().hide)
+  NS.minimapLDB = object
 end
-
--- Slash helpers
-SLASH_GCDOPT1 = "/gcdopt"
-SlashCmdList["GCDOPT"] = function(msg)
-  msg = (msg or ""):lower()
-
-  if msg == "reset" then
-    ResetSegment()
-    return
-  end
-  if msg == "start" then
-    if not (NS.state and NS.state.inSegment) then NS:StartSegment(GetTime()) end
-    return
-  end
-  if msg == "stop" then
-    if NS.state and NS.state.inSegment then NS:PauseSegment(GetTime()) end
-    return
-  end
-  if msg == "hide" then
-    local icon = LibStub and LibStub:GetLibrary("LibDBIcon-1.0", true)
-    EnsureDB().hide = true
-    if icon then icon:Hide("GCDOptimizer") end
-    return
-  end
-  if msg == "show" then
-    local icon = LibStub and LibStub:GetLibrary("LibDBIcon-1.0", true)
-    EnsureDB().hide = false
-    if icon then icon:Show("GCDOptimizer") end
-    return
-  end
-
-  ToggleHUD()
-end
-
-local f = CreateFrame("Frame")
-f:RegisterEvent("PLAYER_LOGIN")
-f:SetScript("OnEvent", function()
-  EnsureDB()
-  InitLDB()
-end)

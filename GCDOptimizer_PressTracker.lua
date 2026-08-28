@@ -1,68 +1,49 @@
 -- GCDOptimizer_PressTracker.lua
--- Captures player "press attempts" via secure hooks (local client-side).
--- We record timestamps only (optionally kind/id for future debug).
--- Dedupe: ignore presses within 5ms to avoid double hooks (UseAction + CastSpell* chains).
+-- Records only local press timestamps. Hook arguments are deliberately ignored
+-- so spell names, spell IDs, macro text, action payloads, and target data never
+-- cross into metrics state.
 
 local _, NS = ...
+
 NS.PressTracker = NS.PressTracker or {}
 local P = NS.PressTracker
 
-local function Now()
-  return GetTime()
+local function RecordPress()
+  if not (NS.state and NS.state.inSegment) then return end
+
+  local now = GetTime()
+  local last = P.lastPressAt or 0
+  if last > 0 and (now - last) < 0.005 then
+    return
+  end
+
+  P.lastPressAt = now
+  if type(NS.OnPress) == "function" then
+    NS:OnPress(now)
+  end
+end
+
+local function HookGlobal(name)
+  if type(_G[name]) == "function" then
+    hooksecurefunc(name, RecordPress)
+  end
 end
 
 function P:Reset()
   self.lastPressAt = 0
 end
 
-local function RecordPress(kind, id)
-  if not (NS.state and NS.state.inSegment) then return end
-  if not (NS.Metrics and NS.Metrics.OnPress) then return end
-
-  local now = Now()
-
-  -- Deduplicate very tight duplicates from multiple hooks in same input chain
-  if P.lastPressAt and (now - P.lastPressAt) < 0.005 then
-    return
-  end
-  P.lastPressAt = now
-
-  NS.Metrics:OnPress(now, kind, id)
-end
-
-function P:InstallHooks()
+function P:Init()
   if self.hooksInstalled then return end
   self.hooksInstalled = true
   self:Reset()
 
-  -- Most action-bar keybinds go through UseAction
-  hooksecurefunc("UseAction", function(slot)
-    RecordPress("action", slot)
-  end)
+  HookGlobal("UseAction")
+  HookGlobal("CastSpellByID")
+  HookGlobal("CastSpellByName")
+  HookGlobal("UseInventoryItem")
 
-  -- Spellbook / direct casting paths (some macros)
-  if CastSpellByID then
-    hooksecurefunc("CastSpellByID", function(spellID)
-      RecordPress("spellID", spellID)
-    end)
-  end
-
-  if CastSpellByName then
-    hooksecurefunc("CastSpellByName", function(spellName)
-      RecordPress("spell", spellName)
-    end)
-  end
-
-  -- Macro execution (very broad; may be noisy, but still reflects player input)
-  if RunMacroText then
-    hooksecurefunc("RunMacroText", function()
-      RecordPress("macro", 0)
-    end)
+  if type(C_Spell) == "table" and type(C_Spell.CastSpell) == "function" then
+    hooksecurefunc(C_Spell, "CastSpell", RecordPress)
   end
 end
-
-local f = CreateFrame("Frame")
-f:RegisterEvent("PLAYER_LOGIN")
-f:SetScript("OnEvent", function()
-  P:InstallHooks()
-end)

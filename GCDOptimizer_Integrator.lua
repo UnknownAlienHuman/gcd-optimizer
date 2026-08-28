@@ -1,24 +1,16 @@
 -- GCDOptimizer_Integrator.lua
--- Computes predicted GCD over time and integrates "possible GCD intervals" piecewise.
--- Goal: avoid undercounting possible GCD when haste/SQW changes during fight.
+-- Piecewise integration of the last ordinary GCD duration supplied by the
+-- estimator. It never reads combat state directly.
 
 local _, NS = ...
-local U = NS.Util
 
 NS.Integrator = NS.Integrator or {}
 local I = NS.Integrator
 
-local function Now() return GetTime() end
-
-local function Clamp(v, a, b)
-  if v < a then return a end
-  if v > b then return b end
-  return v
+local function Now()
+  return GetTime()
 end
 
--- Predicted GCD model:
--- In Midnight, UnitSpellHaste / cooldown fields can become Secret in combat.
--- Always ask GCDEstimator for a safe numeric prediction.
 local function ComputePredictedGCD()
   if NS.GCDEstimator and NS.GCDEstimator.GetPredictedGCD then
     return NS.GCDEstimator:GetPredictedGCD()
@@ -29,51 +21,54 @@ end
 function I:Reset()
   self.started = false
   self.segStart = 0
-
   self.lastT = 0
   self.lastG = 1.5
-  self.totalIntervals = 0 -- integral of dt/g over [segStart, lastT]
-
-  self.sampleMin = 0.30   -- seconds; sampling granularity for piecewise integration
+  self.totalIntervals = 0
+  self.sampleMin = 0.30
   self._nextSampleAt = 0
 end
 
-function I:OnSegmentStart(t0)
+function I:OnSegmentStart(startTime)
   self:Reset()
   self.started = true
-  self.segStart = t0 or Now()
-
-  local g = ComputePredictedGCD()
+  self.segStart = startTime or Now()
   self.lastT = self.segStart
-  self.lastG = g
-  self.totalIntervals = 0
+  self.lastG = ComputePredictedGCD()
   self._nextSampleAt = self.segStart + self.sampleMin
 end
 
-function I:OnSegmentEnd(t1)
-  -- no-op; end time is read from NS.state.segmentEndEffective/segmentEnd
+-- Used only for the first auto-combat GCD when PLAYER_REGEN_DISABLED arrives
+-- just after that GCD started. No integrated samples exist yet at this point.
+function I:ReanchorStart(startTime)
+  if type(startTime) ~= "number" or startTime <= 0 then return end
+  self.started = true
+  self.segStart = startTime
+  self.lastT = startTime
+  self.lastG = ComputePredictedGCD()
+  self.totalIntervals = 0
+  self._nextSampleAt = startTime + (self.sampleMin or 0.30)
 end
 
--- Internal sampling: add one piece [lastT, tNow] using lastG, then update lastG.
-function I:_SampleAt(tNow)
-  if not self.started then return end
-  if tNow <= self.lastT then return end
+function I:OnSegmentEnd()
+  -- The final end point is read from NS.state by GetPossibleFight().
+end
 
-  -- integrate with lastG
-  local dt = tNow - self.lastT
-  if dt > 0 and self.lastG > 0 then
-    self.totalIntervals = self.totalIntervals + (dt / self.lastG)
+function I:_SampleAt(timestamp)
+  if not self.started or timestamp <= self.lastT then return end
+
+  local elapsed = timestamp - self.lastT
+  if elapsed > 0 and self.lastG > 0 then
+    self.totalIntervals = self.totalIntervals + (elapsed / self.lastG)
   end
 
-  -- update
-  self.lastT = tNow
+  self.lastT = timestamp
   self.lastG = ComputePredictedGCD()
 end
 
--- Called frequently by HUD; only records samples when segment active and time reached.
 function I:MaybeSample(now)
   if not (NS.state and NS.state.inSegment) then return end
   now = now or Now()
+
   if not self.started then
     self:OnSegmentStart(NS.state.segmentStart or now)
   end
@@ -102,40 +97,31 @@ local function GetEndTime(now)
   return now or Now()
 end
 
--- Returns float: possible INTERVALS (not starts) between segment start and end.
--- HUD converts to starts as floor(intervals + 1).
 function I:GetPossibleFight(now)
   if not (NS.state and NS.state.segmentStart and NS.state.segmentStart > 0) then
     return 0
   end
 
-  local tEnd = GetEndTime(now)
-  if tEnd <= (NS.state.segmentStart or 0) then return 0 end
+  local endTime = GetEndTime(now)
+  if endTime <= NS.state.segmentStart then return 0 end
 
-  -- If segment active, keep sampling up to now (piecewise integration).
   if NS.state.inSegment then
-    self:MaybeSample(tEnd)
+    self:MaybeSample(endTime)
   end
-
-  -- Ensure we have baseline.
   if not self.started then
     self:OnSegmentStart(NS.state.segmentStart)
   end
 
-  -- totalIntervals covers [segStart, lastT]. If end is beyond lastT (pause/end), extend with lastG.
   local total = self.totalIntervals or 0
-  if self.lastT and tEnd > self.lastT and self.lastG and self.lastG > 0 then
-    total = total + ((tEnd - self.lastT) / self.lastG)
+  if self.lastT and endTime > self.lastT and self.lastG and self.lastG > 0 then
+    total = total + ((endTime - self.lastT) / self.lastG)
   end
-  if total < 0 then total = 0 end
-  return total
+  return math.max(0, total)
 end
 
--- For tails/short ranges; approximate using predicted GCD at call time.
--- (We keep it simple because callers use it for near-now windows.)
-function I:GetPossibleBetween(tA, tB, now)
-  if not tA or not tB or tB <= tA then return 0 end
-  local g = ComputePredictedGCD()
-  if g <= 0 then return 0 end
-  return (tB - tA) / g
+function I:GetPossibleBetween(startTime, endTime)
+  if not startTime or not endTime or endTime <= startTime then return 0 end
+  local duration = ComputePredictedGCD()
+  if duration <= 0 then return 0 end
+  return (endTime - startTime) / duration
 end
