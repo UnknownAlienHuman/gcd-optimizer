@@ -28,4 +28,4 @@ GCDOptimizer_Options.lua
 GCDOptimizer_Minimap.lua
 GCDOptimizer_Core.lua
 
-# GCDOptimizer_Test.lua is a developer-only harness and is intentionally not loaded.
+# Developer diagnostics are intentionally excluded from production load order.
