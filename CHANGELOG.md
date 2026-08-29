@@ -1,45 +1,38 @@
 # Changelog
 
+## Unreleased correction — 2026-08-29
+
+### GCD regression repair
+
+- Restored the original `UnitAttackSpeed`-calibrated GCD estimator after the 12.1 pass incorrectly removed it.
+- Restored the `UNIT_SPELLCAST_SUCCEEDED` candidate-start fallback for combat contexts where numerical `61304` timing cannot be used.
+- Preserved unrelated 12.1 fixes: detector initialization, single command ownership, SavedVariables migration, payload-free press/failure tracking, and obsolete API cleanup.
+- Removed an unexecuted direct-only migration workflow and its one-shot script.
+- Opened issue #5 to resolve the conflict between Blizzard's documented `61304` whitelist and the project's combat runtime history.
+
+### Documentation correction
+
+- Retracted the claim that direct `61304` timing is sufficient in every supported context.
+- Documented direct, swing-estimated, and cached-low-confidence observation classes.
+- Marked off-GCD event inference, one-second-GCD calibration, weapon swaps, and source-confidence separation as open correctness work.
+
 ## 0.5.0-midnight-12.1 — 2026-08-27
 
-### Compatibility
+### Compatibility and infrastructure
 
 - Updated the addon to Retail 12.1.0 / Interface `120100`.
-- Pinned engineering review to Blizzard UI source build `12.1.0.69497`, commit `027d26c3406d3de2cbd2b1f67d468fe033a1bcd4`.
+- Pinned review to Blizzard UI source build `12.1.0.69497`, commit `027d26c3406d3de2cbd2b1f67d468fe033a1bcd4`.
+- Fixed Core bootstrap so `GCDOptimizer_GCDDetector:Init()` registers its events.
+- Centralized lifecycle, HUD visibility, command dispatch, and compatible SavedVariables migration.
+- Unified production slash commands under one `/gcdopt` handler.
+- Excluded the developer test harness from the production TOC.
 
-### Correctness
+### Security and cleanup
 
-- Fixed Core bootstrap so `GCDOptimizer_GCDDetector:Init()` actually registers its events.
-- Replaced successful-cast inference with authoritative reads of the GCD dummy cooldown (`61304`).
-- Removed the unavailable `C_Spell.DoesSpellTriggerGlobalCooldown` dependency.
-- Prevented off-GCD abilities from being counted as GCD starts.
-- Prevented manual segments from claiming a GCD that was already running before tracking began; auto-combat segments reanchor to the triggering GCD start.
-- Removed unreliable `UnitAttackSpeed` haste reconstruction.
+- Made action press tracking timestamp-only.
+- Removed combat-log and raw `UI_ERROR_MESSAGE` failure-reason inference.
+- Bounded overlay diagnostics and removed obsolete `GetMouseFocus` use.
 
-### Secret-value and taint safety
+### Superseded GCD change
 
-- Added a centralized accessibility gate before cooldown fields are inspected or retained.
-- Changed press tracking to retain timestamps only; hook arguments are discarded.
-- Removed combat-log and `UI_ERROR_MESSAGE` failure-reason inference.
-- Changed failure tracking to payload-free player failure counts with generic categorization.
-- Restricted anchor diagnostics to accessibility-gated overlay glow events and ordinary local press timestamps.
-- Removed obsolete `GetMouseFocus` use from the settings panel.
-
-### Lifecycle and performance
-
-- Reduced default detector polling from `0.02` to `0.05` seconds.
-- Ensured detector timers are segment-scoped and cancelled on reset/end.
-- Centralized initialization, lifecycle, HUD visibility, and command dispatch in Core.
-
-### User-facing behavior
-
-- Unified all production slash commands under one `/gcdopt` handler.
-- Removed slash-command shadowing by Minimap and Test modules.
-- Excluded the developer test harness from the production TOC; its manual command is `/gcdopttest`.
-- Added minimap icon show/hide subcommands.
-- Changed SavedVariables upgrades to preserve compatible settings through explicit schema migration.
-
-### Verification status
-
-- Static syntax and forbidden-symbol checks are required and recorded with this update.
-- Current-client combat validation remains open in GitHub issue #1; this source must not be treated as a packaged release until that smoke matrix is complete.
+The initial 0.5.0 pass removed attack-speed reconstruction and attempted a direct-only `61304` detector. That decision was reverted by the 2026-08-29 correction above because it discarded an intentional combat fallback without named-build runtime proof.

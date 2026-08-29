@@ -1,61 +1,62 @@
 # Architecture
 
-## Bootstrap and ownership
+## Composition root
 
-`GCDOptimizer_Core.lua` loads last and is the composition root. It owns `GCDOptimizerDB`, schema/default migration, module initialization, segment lifecycle, combat autostart/autostop, HUD visibility, and the sole `/gcdopt` dispatcher.
+`GCDOptimizer_Core.lua` loads last and owns `GCDOptimizerDB`, schema/default migration, module initialization, segment lifecycle, combat automation, HUD visibility, and the sole `/gcdopt` dispatcher.
 
-The production TOC excludes `GCDOptimizer_Test.lua`; the developer harness uses the separate `/gcdopttest` command when manually loaded.
-
-## Data flow
+## Timing data flow
 
 ```text
-secure action post-hooks
-        │ timestamp only
-        ▼
- PressTracker ───────────────► Metrics ───────────────► HUD
-                                     ▲                   ▲
-                                     │                   │
- C_Spell cooldown 61304 ─► Util gate ─► Detector ───────┤
-                                     │                   │
-                                     └► Estimator ─► Integrator
+C_Spell.GetSpellCooldown(61304)
+        │
+        ├── ordinary numeric fields ──────────────► Detector: DIRECT_EXACT
+        │                                              │
+        │                                              ▼
+        │                                            Metrics
+        │
+        └── Secret/unusable numeric fields
+                      │
+UnitAttackSpeed(player) ─► calibrated ratio ─► Estimator: ESTIMATED_SWING
+                      │                             ▲
+UNIT_SPELLCAST_SUCCEEDED ─► candidate timestamp ───┘
 
- UNIT_SPELLCAST_FAILED(*) ─► Failures (timestamp only) ─► HUD
- overlay glow show/hide ───► Anchors (bounded diagnostic ring)
+secure action post-hooks ─► local press timestamps ─► Metrics ─► HUD
+Estimator ─► Integrator ──────────────────────────────────────► HUD
+player failure events ─► payload-free Failures ───────────────► HUD
+overlay glow events ─► bounded Anchors diagnostics
 ```
+
+## Evidence classes
+
+### DIRECT_EXACT
+
+Accessible `61304` start/duration values. These are the preferred source and can replace an event estimate for the same cycle.
+
+### ESTIMATED_SWING
+
+Direct numbers are unusable, but accessible attack-speed calibration and local event timing remain. This preserves functionality under the project's reported Midnight combat behavior. It is approximate and must be labeled.
+
+### CACHED_LOW_CONFIDENCE
+
+Neither current direct timing nor swing speed can be used. The last stable duration may keep the UI coherent, but no exact start or latency claim may be manufactured.
+
+The current restored implementation does not yet attach these labels to every metric record; issue #5 owns that hardening.
 
 ## Security boundary
 
-`GCDOptimizer_Util.lua:ReadSpellCooldown` is the only direct spell-cooldown boundary. It verifies accessibility before inspecting, comparing, formatting, indexing, or retaining returned fields. The detector and estimator consume only ordinary numeric values from this boundary.
+Both `C_Spell.GetSpellCooldown(61304)` and `UnitAttackSpeed("player")` are restriction-sensitive sources. A documented spell whitelist does not replace per-use accessibility checks. A successful `pcall` does not declassify data.
 
-A successful spellcast schedules a cooldown read but never becomes an inferred GCD start. Input and failure callbacks discard their payloads. No combat-log, UI-error-text, aura, target, resource, or unit-stat reconstruction path exists.
+Input hooks retain timestamps only. Failure tracking does not parse combat log or UI-error payloads. Transient spellcast payloads used by the fallback detector must not flow into SavedVariables or general feature state.
 
-## State
+## Known approximation risks
 
-Persistent:
-
-- `GCDOptimizerDB`: compatible configuration only;
-- `__addonVersion`: release metadata;
-- `__schemaVersion`: migration contract.
-
-Transient:
-
-- detector/estimator state;
-- press timestamps;
-- metric deques and segment aggregates;
-- failure timestamps;
-- overlay diagnostic ring;
-- UI frame and ticker state.
-
-Transient combat observations must not be copied into SavedVariables.
-
-## Timing ownership
-
-- Detector establishes confirmed GCD starts and observed durations.
-- Estimator supplies the last accessible duration/fallback.
-- Integrator computes possible intervals from the estimator.
-- Metrics classifies input and accounts for gaps.
-- HUD renders snapshots; it does not discover combat state.
+- attack speed can diverge from GCD haste;
+- weapon swaps alter swing speed independently of haste;
+- a default `1.5` base GCD is wrong for some specs;
+- successful off-GCD actions can reach the fallback detector;
+- success-event timing differs among instant, cast-time, channelled, and empowered spells;
+- exact and estimated samples are not yet separated in recommendations.
 
 ## Lifecycle
 
-Core initializes modules once, resets a clean baseline, then starts segments manually or on combat entry. A manual start primes an already-active cooldown without counting it; an auto-combat start may reanchor the segment to the triggering GCD. Detector and HUD timers exist only while needed and are cancelled on reset/end. `ResetAndContinue` clears samples without changing whether the segment was manually or automatically running.
+Core initializes modules once and starts/stops segment-scoped work. Detector and HUD timers must be cancelled on reset/end. Direct polling and event fallback must deduplicate the same GCD rather than creating two metric cycles.

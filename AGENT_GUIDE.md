@@ -2,97 +2,86 @@
 
 ## Current contract
 
-Target Retail `12.1.0`, Interface `120100`, addon version `0.5.0-midnight-12.1`. The pinned engineering baseline is Blizzard build `12.1.0.69497`, source commit `027d26c3406d3de2cbd2b1f67d468fe033a1bcd4`, reviewed 2026-08-27.
+Target Retail `12.1.0`, Interface `120100`, addon version `0.5.0-midnight-12.1`. Blizzard source baseline: build `12.1.0.69497`, commit `027d26c3406d3de2cbd2b1f67d468fe033a1bcd4`.
 
-Read the project knowledge base before changing code:
+Read before changing timing logic:
 
-- [wow-addon-engineering-kb](https://github.com/UnknownAlienHuman/wow-addon-engineering-kb)
-- `KB/addon/Patch_12_1_0_Addon_Changes.md`
-- `KB/core/BlizzardUI_security.md`
-- `KB/core/BlizzardUI_Performance_Modules.md`
-- `KB/deep/Spell_Secrecy_Registry_12_1_0.md`
+- `README_MIDNIGHT.md`
+- `GCD_RUNTIME_EVIDENCE.md`
+- issue #5
+- the project knowledge base at `UnknownAlienHuman/wow-addon-engineering-kb`
 
-## Load order and bootstrap
+## Non-negotiable historical fact
 
-`GCDOptimizer.toc` loads libraries, utilities/locales, runtime modules, UI adapters, and finally `GCDOptimizer_Core.lua`. Core owns:
+The original Midnight implementation contains an intentional `UnitAttackSpeed`-calibrated fallback because direct numerical GCD timing was reported or expected to become Secret in combat. Do **not** remove that fallback based only on a whitelist note, Wowhead flag, out-of-combat read, or another addon's implementation.
 
-- SavedVariables/default migration;
-- module initialization;
-- segment start, pause, reset, and combat automation;
-- HUD visibility;
-- the only `/gcdopt` registration.
-
-`GCDOptimizer_Test.lua` is intentionally absent from the production TOC and uses `/gcdopttest` when manually enabled.
+The external record also says Blizzard intended `61304` to be non-secret. Treat this as an unresolved runtime discrepancy until a named-build/context matrix exists.
 
 ## Runtime map
 
-- `GCDOptimizer_Util.lua`: accessibility predicates, the centralized `C_Spell.GetSpellCooldown` boundary, deque, and statistics.
-- `GCDOptimizer_GCDEstimator.lua`: last accessible GCD duration and session fallback; no unit-stat or swing-speed inference.
-- `GCDOptimizer_GCDDetector.lua`: segment-only polling of spell `61304`; cast success schedules a read but never proves a GCD.
-- `GCDOptimizer_PressTracker.lua`: secure hooks with zero-argument callbacks; only local timestamps enter metrics.
-- `GCDOptimizer_Metrics.lua`: queue, late, idle, waste, lost-GCD, and SQW analysis.
-- `GCDOptimizer_Integrator.lua`: piecewise predicted-GCD integration.
-- `GCDOptimizer_Failures.lua`: payload-free player cast-failure timestamps; public reason is generic `OTH`.
-- `GCDOptimizer_Anchors.lua`: bounded, optional overlay show/hide diagnostics with accessibility-gated spell IDs.
-- `GCDOptimizer_HUD.lua`: rendering and analysis; do not move combat-data reads into the HUD.
-- `GCDOptimizer_Options.lua`: language panel only.
-- `GCDOptimizer_Minimap.lua`: LDB/DBIcon adapter; no slash registration.
+- `GCDOptimizer_Core.lua`: composition root, DB migration, lifecycle, combat automation, HUD visibility, sole `/gcdopt` dispatcher.
+- `GCDOptimizer_GCDEstimator.lua`: direct duration first; attack-speed calibration, EWMA correction, and last-stable fallback.
+- `GCDOptimizer_GCDDetector.lua`: direct cooldown polling plus `UNIT_SPELLCAST_SUCCEEDED` candidate-start fallback.
+- `GCDOptimizer_PressTracker.lua`: action hooks; local timestamps only enter metrics.
+- `GCDOptimizer_Metrics.lua`: queue, late, idle, waste, loss, and SQW analysis.
+- `GCDOptimizer_Integrator.lua`: possible-GCD integration from the estimator.
+- `GCDOptimizer_Failures.lua`: payload-free failure timestamps.
+- `GCDOptimizer_Anchors.lua`: bounded overlay diagnostics.
+- `GCDOptimizer_HUD.lua`: presentation; no combat-data discovery.
+- `GCDOptimizer_Options.lua` / `GCDOptimizer_Minimap.lua`: settings and launcher adapters.
+
+## Observation classes
+
+Every future hardening pass must distinguish:
+
+- `DIRECT_EXACT`: accessible `61304` numerical start/duration;
+- `ESTIMATED_SWING`: duration derived from accessible attack-speed calibration and start inferred from non-secret event/activity evidence;
+- `CACHED_LOW_CONFIDENCE`: last stable duration only, with no fabricated exact start.
+
+Do not merge these classes into one undifferentiated metric stream.
 
 ## Security invariants
 
-1. Gate Secret-capable values before branch, comparison, arithmetic, formatting, concatenation, indexing, iteration, logging, persistence, or forwarding.
-2. `issecretvalue` describes provenance; use `canaccessvalue`/`canaccessallvalues` for the use boundary.
-3. `pcall` is not declassification.
-4. Do not add combat-log, raw aura, UI-error-text, focus/layout, or forbidden-object inference paths.
-5. Do not retain action, spell, macro, item, target, cast-GUID, or error payloads merely because one build currently exposes them.
-6. Do not replace Blizzard globals or monkey-patch secure APIs.
-7. If `61304` becomes inaccessible, fail closed. Do not reconstruct the hidden duration from another restricted statistic.
+1. Gate every Secret-capable value before branch, comparison, arithmetic, formatting, indexing, logging, persistence, or forwarding.
+2. `pcall` is diagnostics/error containment, not declassification.
+3. Direct `61304` fields and `UnitAttackSpeed` are independent optional sources; either can become unusable.
+4. Never perform swing-ratio arithmetic unless both baseline and current values are ordinary accessible positive numbers.
+5. Do not bridge a blind interval as if it were exact evidence.
+6. Do not recover spell identity from protected frames, combat log, UI error text, target data, macro text, or timing side channels.
+7. Transient spell IDs from `UNIT_SPELLCAST_SUCCEEDED` may only support an explicitly allowed, accessibility-checked classifier and must not be persisted into metrics/SavedVariables.
+8. `C_Spell.DoesSpellTriggerGlobalCooldown` is absent from the pinned generated API contract; never assume it exists.
 
-## Lifecycle invariants
+## Correctness invariants
 
-- `NS.state.inSegment` gates all timing writes.
-- Detector/HUD tickers must be cancelled on reset/end and must not multiply after `/reload` or repeated starts.
-- `GCDDetector:Init()` must run before `OnSegmentStart()`.
-- Metrics and Integrator must start before Detector's first poll can emit `NS:OnGCDStart`.
-- A pre-existing cooldown is primed but not counted for manual starts; the first auto-combat GCD may reanchor Metrics and Integrator by at most two seconds.
-- Entering combat replaces a running manual segment only when combat autostart is enabled.
-- Auto-stop applies only to an auto-started combat segment.
-- Reset preserves the current running/auto state through `ResetAndContinue`.
+- Direct cooldown starts override event estimates for the same cycle.
+- Off-GCD successes must not be counted as exact GCD starts.
+- Instant, cast-time, channelled, and empowered event orderings are different test cases.
+- One-second base-GCD specs must not inherit a silent `1.5` baseline.
+- Weapon swaps and attack-speed-only modifiers must invalidate or recalibrate swing-derived estimates.
+- Estimated/ambiguous samples must not drive exact latency or SpellQueueWindow recommendations.
+- Detector and HUD tickers must remain segment-scoped and cancellable.
 
 ## SavedVariables
 
-`GCDOptimizerDB` is migrated by `__schemaVersion`, not erased on every release string change. Additive defaults belong in `GCDOptimizer_Core.lua:DEFAULTS`. Any incompatible schema change requires an explicit, reviewable migration.
+Store compatible configuration only. Never persist raw combat samples or protected payloads. Schema changes require explicit migration; release-string changes must not erase user settings.
 
-Never store transient timing samples or restricted payloads in SavedVariables.
-
-## Change routing
-
-- API/accessibility boundary: `GCDOptimizer_Util.lua`.
-- GCD source or de-duplication: `GCDOptimizer_GCDDetector.lua` and `GCDOptimizer_GCDEstimator.lua`.
-- Input sources: `GCDOptimizer_PressTracker.lua`; callbacks must remain payload-free.
-- Accounting formulas: `GCDOptimizer_Metrics.lua`; update labels and test evidence together.
-- Segment/combat behavior or commands: `GCDOptimizer_Core.lua`.
-- Failure evidence: `GCDOptimizer_Failures.lua`; do not recover removed reason inference without a current contract.
-- Presentation: `GCDOptimizer_HUD.lua`; keep data collection outside render code.
-- Launcher/settings: `GCDOptimizer_Minimap.lua` and `GCDOptimizer_Options.lua`.
-
-## Static verification
+## Static review
 
 ```powershell
 rg -n "^## Interface|^## Version" GCDOptimizer.toc
 rg -n "SLASH_GCDOPT1|SlashCmdList[.\[]GCDOPT" .
-rg -n "DoesSpellTriggerGlobalCooldown|GetMouseFocus|COMBAT_LOG_EVENT_UNFILTERED|UI_ERROR_MESSAGE" .
-rg -n "UnitAttackSpeed|UnitSpellHaste|RunMacroText" GCDOptimizer_*.lua
+rg -n "UnitAttackSpeed|GetSpellCooldown\(.*61304|UNIT_SPELLCAST_SUCCEEDED" GCDOptimizer_*.lua
+rg -n "DoesSpellTriggerGlobalCooldown|COMBAT_LOG_EVENT_UNFILTERED|UI_ERROR_MESSAGE" GCDOptimizer_*.lua
 rg -n "GCDOptimizer_Test.lua" GCDOptimizer.toc
 ```
 
-Expected results:
+Expected:
 
-- Interface `120100` and version `0.5.0-midnight-12.1`;
-- exactly one production `/gcdopt` registration, in Core;
-- no obsolete API or restricted inference matches in runtime files;
-- no test harness in the TOC.
+- exactly one production `/gcdopt` dispatcher;
+- `UnitAttackSpeed` remains present in the estimator until issue #5 is resolved by runtime evidence;
+- all Secret-capable reads have explicit use boundaries;
+- no production test harness in the TOC.
 
 ## Live verification
 
-Follow [todo.md](todo.md) and GitHub issue #1. Static review cannot establish current hotfixed secrecy policy, real client event ordering, or class-specific accuracy. Record build/context and preserve failures as evidence rather than guessing.
+Follow `todo.md`, issue #1, and issue #5. Static Lua tests cannot resolve spell-data policy, taint context, or event ordering in the WoW client.

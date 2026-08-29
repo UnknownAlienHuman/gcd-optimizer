@@ -1,125 +1,148 @@
 # GCD Optimizer — Retail 12.1 engineering notes
 
-## Release baseline
+## Baseline
 
 | Field | Value |
 | --- | --- |
 | Addon version | `0.5.0-midnight-12.1` |
-| WoW patch contract | Retail `12.1.0` |
+| Patch contract | Retail `12.1.0` |
 | Interface | `120100` |
-| Reviewed live source | `12.1.0.69497` |
+| Blizzard source build | `12.1.0.69497` |
 | Blizzard source commit | `027d26c3406d3de2cbd2b1f67d468fe033a1bcd4` |
-| Review date | 2026-08-27 |
+| Review date | 2026-08-29 |
 
-The implementation follows the repository at [wow-addon-engineering-kb](https://github.com/UnknownAlienHuman/wow-addon-engineering-kb), particularly its 12.1 migration guide, security model, performance guidance, and spell-secrecy registry.
+## 1. Correction to the direct-only migration
 
-## 1. GCD observation contract
+The first 12.1 pass removed `UnitAttackSpeed` estimation and treated accessible `C_Spell.GetSpellCooldown(61304)` values as the only valid GCD source. That change was not justified by the addon's runtime history.
 
-`GCDOptimizer_Util.lua` owns the only spell-cooldown read boundary:
+The pre-update source explicitly documents that the numerical GCD cooldown could become Secret in Midnight combat. Its attack-speed path was an intentional degradation model, not unused legacy code. The known estimator and detector were restored in commit `d46f268e90ea9b669ff8570a61954b8ff21dd97f` while retaining unrelated 12.1 fixes such as Core initialization, command ownership, SavedVariables migration, payload-free input tracking, and generic failure handling.
 
-1. call `C_Spell.GetSpellCooldown(61304)`;
-2. gate the returned object and both numeric fields with `canaccessallvalues`/`canaccessvalue` before any use;
-3. accept only ordinary positive numbers;
-4. collapse inaccessible, inactive, missing, or malformed data to `nil`.
+## 2. Evidence conflict
 
-`GCDOptimizer_GCDDetector.lua` polls that boundary at 20 Hz by default. `UNIT_SPELLCAST_SUCCEEDED` merely requests an immediate read and a zero-delay follow-up read. The event payload is discarded, and a successful cast is never assumed to trigger the GCD.
+Two evidence sets currently disagree:
 
-A manual segment that begins during an already-running GCD primes that cooldown without counting activity from before the user started tracking. An auto-combat segment counts the combat-triggering GCD and reanchors the segment to its real cooldown start when `PLAYER_REGEN_DISABLED` arrived slightly later.
+### Documented/community evidence
 
-This fixes two older design errors:
+Blizzard-origin addon-engineering notes list `61304` among cooldowns flagged non-secret. WoWUIDev discussions in January, February, and May 2026 describe direct reads of the GCD dummy spell as usable, including in combat-oriented UI code.
 
-- the previous detector depended on `C_Spell.DoesSpellTriggerGlobalCooldown`, which is not part of the current generated API contract;
-- its conservative fallback counted every successful cast, including off-GCD abilities.
+### Project evidence
 
-The detector is now explicitly initialized by Core. The previous build called `Reset()` but never `Init()`, so its event frame was never registered.
+The original GCD Optimizer implementation says direct numeric cooldown timing became Secret in Midnight combat and therefore uses attack-speed calibration plus local cast timestamps.
 
-## 2. Duration estimation
+The original upstream monorepo commit date and the exact client build/error log behind that decision are not available in the split repository. Until a named-build runtime matrix resolves the discrepancy, neither evidence set is allowed to erase the other.
 
-`GCDOptimizer_GCDEstimator.lua` no longer derives haste from `UnitAttackSpeed`. Both attack speed and spell haste are restriction-sensitive unit-stat APIs, and weapon-speed ratios are not a reliable cross-class GCD model.
+## 3. Current source priority
 
-The estimator now uses:
+### 3.1 Direct exact timing
 
-1. the current accessible duration of spell `61304`;
-2. the last ordinary duration observed in this client session;
-3. `1.5` seconds only as the initial fallback before the first readable sample.
+When `startTime` and `duration` from spell `61304` are ordinary usable numbers, they are the highest-quality source. The detector polls the cooldown and deduplicates starts with a drift epsilon and minimum-start interval.
 
-The GCD dummy spell is listed in historical Midnight exemptions, but exemptions are data-driven and may change through hotfixes. The addon therefore checks accessibility on every read rather than treating `61304` as a permanent whitelist entry.
+The current generated API still marks `C_Spell.GetSpellCooldown` as restriction-sensitive. `SpellCooldownInfo.isActive`, `isEnabled`, and `isOnGCD` have stronger field contracts, but `isOnGCD` is documented as trustworthy only while responding to `SPELL_UPDATE_COOLDOWN`.
 
-## 3. Input boundary
+### 3.2 Attack-speed duration estimate
 
-`GCDOptimizer_PressTracker.lua` installs secure post-hooks for supported player-action paths. Every hook callback has zero parameters and records only `GetTime()`.
+When direct GCD duration cannot be used, the restored estimator:
 
-The following data is deliberately discarded:
+1. records an out-of-combat main-hand swing-speed baseline;
+2. reads the current main-hand speed when accessible;
+3. estimates a haste multiplier as `baseSwing / currentSwing`;
+4. computes `baseGCD / hasteMultiplier`;
+5. clamps the result to `[0.75, 1.5]`;
+6. may gently lower the estimate using cast-to-cast EWMA;
+7. otherwise retains the last stable estimate.
 
-- action slots;
-- spell IDs and names;
-- macro text;
-- item IDs;
-- targets and unit tokens;
-- cast GUIDs.
+This preserves functionality under the project's reported combat behavior, but it is an approximation. Attack speed can diverge from spell haste/GCD behavior through weapon changes, class rules, attack-speed-only effects, or an incorrect base-GCD calibration.
 
-`GCDOptimizer_Metrics.lua` continues to receive its existing record shape, but only the timestamp is populated. This preserves queue/late classification without allowing protected payloads into feature state.
+`UnitAttackSpeed` is also tagged as restriction-sensitive in current generated docs. It must be treated as an optional source and never used in arithmetic when Secret or inaccessible.
 
-## 4. Failure diagnostics
+### 3.3 Event-derived start estimate
 
-The 12.1 implementation does not register `COMBAT_LOG_EVENT_UNFILTERED` and does not parse `UI_ERROR_MESSAGE`. Both approaches are unsuitable as a general restricted-combat inference channel.
+When direct cooldown starts are unavailable, `UNIT_SPELLCAST_SUCCEEDED` supplies a local event timestamp. The restored detector treats eligible player success events as candidate starts and applies a minimum interval to suppress duplicates.
 
-`GCDOptimizer_Failures.lua` listens only for player `UNIT_SPELLCAST_FAILED` and `UNIT_SPELLCAST_FAILED_QUIET`, ignores all payload fields, deduplicates paired notifications, and records timestamps. Its public summary shape remains compatible with the HUD, but failures are categorized as `OTH`.
+Known defects:
 
-This is intentionally less specific and more trustworthy. A reason taxonomy can be restored only when a current Blizzard contract supplies an accessible source for it.
+- the current generated API does not expose `C_Spell.DoesSpellTriggerGlobalCooldown`;
+- the conservative fallback can count off-GCD successes;
+- cast-time success occurs at a different point from an instant spell's GCD start;
+- channel and empowered event ordering require separate validation;
+- a local success timestamp is an estimate, not the server's authoritative GCD start.
 
-## 5. Overlay anchors
+This path must not be presented as exact latency evidence.
 
-The optional anchor diagnostic listens only to Blizzard's glow show/hide events:
+## 4. Required final architecture
 
-- `SPELL_ACTIVATION_OVERLAY_GLOW_SHOW`
-- `SPELL_ACTIVATION_OVERLAY_GLOW_HIDE`
+The stable target is a confidence-aware hybrid:
 
-The overlay spell ID is accessibility-gated before it is compared, indexed, formatted, or stored. Fades may be correlated with a recent ordinary local press timestamp, but the result remains a low-confidence diagnostic and is not used as proof of proc consumption or as a GCD source.
+```text
+DIRECT_EXACT
+  accessible 61304 start/duration
+  -> exact start + observed duration
 
-## 6. Commands and production load order
+ESTIMATED_SWING
+  direct numeric GCD unavailable
+  + accessible attack speed calibration
+  + event/cooldown activity evidence
+  -> estimated start/duration
 
-`GCDOptimizer_Core.lua` is the sole owner of `/gcdopt`. The duplicate handlers formerly declared in `GCDOptimizer_Minimap.lua` and `GCDOptimizer_Test.lua` have been removed.
+CACHED_LOW_CONFIDENCE
+  neither direct timing nor swing speed usable
+  -> preserve last stable duration only
+  -> do not manufacture exact samples
+```
 
-`GCDOptimizer_Test.lua` is excluded from the production TOC. When a developer temporarily loads it, it registers the separate `/gcdopttest` command.
+Metrics must record the observation source. Exact latency and SpellQueueWindow recommendations must exclude low-confidence and ambiguous samples until their error model is validated.
 
-Core loads last and owns bootstrap, configuration, module initialization, segment lifecycle, combat automation, HUD visibility, and command dispatch.
+## 5. Input and failure boundaries retained from the 12.1 pass
 
-## 7. SavedVariables
+`GCDOptimizer_PressTracker.lua` keeps only local timestamps from secure post-hooks. It does not persist action slots, spell IDs, macro text, item IDs, targets, or cast GUIDs.
 
-The old build erased `GCDOptimizerDB` whenever `NS.VERSION` changed. Version `0.5.0` introduces schema-owned migration:
+`GCDOptimizer_Failures.lua` records payload-free player failure timestamps. It does not reconstruct restricted reasons through combat log or UI error text.
 
-- compatible fields survive addon updates;
-- missing defaults are merged recursively;
-- `__addonVersion` records the release;
-- `__schemaVersion` determines future migration behavior.
+These changes are independent of the GCD source regression and remain in place.
 
-## 8. Removed obsolete API use
+## 6. Lifecycle
 
-The settings panel no longer calls `GetMouseFocus`, which was removed from the modern API. The language menu closes when the panel hides and does not inspect focus state.
+Core owns bootstrap, configuration, segment lifecycle, combat automation, HUD visibility, and `/gcdopt`. `GCDDetector:Init()` is called before tracking begins. Detector and HUD tickers are cancelled outside active use.
 
-## 9. Performance posture
+The restored detector currently counts the first observed active GCD in a segment. Manual versus auto-combat priming/reanchoring needs live regression testing because the restored event fallback predates the newer lifecycle assumptions.
 
-- detector ticker: default `0.05` seconds, active only during a segment;
-- HUD ticker: unchanged configurable cadence, stopped while hidden or after segment end;
-- cast-success events cause bounded immediate reads, not analytics work;
-- input hooks allocate no payload copies;
-- failure history is timestamp-only and periodically compacted;
-- overlay diagnostics use a bounded ring.
+## 7. Required runtime matrix
 
-## 10. Required live verification
+Record exact client version, build, Interface, date, content type, and taint/restriction context.
 
-Static validation cannot prove live event ordering, current hotfixed secrecy policy, or class-specific timing behavior. Before release, test on the target client:
+For spell `61304`, capture:
 
-1. fresh login and `/reload` with no Lua errors;
-2. all `/gcdopt` commands and minimap gestures;
-3. automatic and manual segment lifecycle;
-4. an ordinary haste-affected spec and a one-second-GCD spec;
-5. off-GCD abilities mixed into the rotation;
-6. channelled, empowered, instant, item, and macro actions;
-7. combat, encounter, Mythic+, arena, and battleground restriction states;
-8. `SPELL_SECRECY_CHANGED` while a segment is active;
-9. HUD hidden/shown and long-session timer cleanup;
-10. persistence of HUD, language, anchor, and minimap settings across `/reload`.
+```text
+C_Secrets.HasSecretRestrictions()
+C_Secrets.ShouldCooldownsBeSecret()
+C_Secrets.GetSpellCooldownSecrecy(61304)
+C_Secrets.ShouldSpellCooldownBeSecret(61304)
+canaccessvalue(startTime)
+canaccessvalue(duration)
+canaccessvalue(modRate)
+```
 
-Record client version, build, Interface, context, Lua errors, and the `/gcdopt debug` output. GitHub issue #1 remains the release gate until this matrix is completed.
+For the fallback, capture:
+
+```text
+canaccessvalue(UnitAttackSpeed("player"))
+baseSwing
+currentSwing
+estimatedGCD
+direct/estimated/cached source
+```
+
+Test at minimum:
+
+1. outside combat and open-world combat;
+2. encounter combat and Mythic+;
+3. arena and battleground;
+4. ordinary and one-second-GCD specs;
+5. haste changes, attack-speed-only effects, and weapon swaps;
+6. instant, cast-time, channelled, empowered, item, and macro actions;
+7. off-GCD abilities mixed into every rotation;
+8. `SPELL_SECRECY_CHANGED` and forced restriction states where supported;
+9. repeated starts/stops/resets and `/reload`;
+10. exact versus estimated metric output against a recorded manual timeline.
+
+Issues #1 and #5 are release gates.

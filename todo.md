@@ -1,40 +1,48 @@
 # GCD Optimizer — release checklist
 
-## Completed static migration
+## Preserved 12.1 work
 
-- [x] Target Retail 12.1.0 with exact Interface `120100`.
-- [x] Bump addon/Core/docs to `0.5.0-midnight-12.1`.
-- [x] Centralize and gate all `C_Spell.GetSpellCooldown(61304)` fields before use.
-- [x] Remove `DoesSpellTriggerGlobalCooldown` dependency and cast-success GCD inference.
+- [x] Target Retail 12.1.0 / Interface `120100`.
 - [x] Initialize `GCDOptimizer_GCDDetector` from Core.
-- [x] Reduce detector polling from 50 Hz to 20 Hz by default and stop it outside segments.
-- [x] Remove swing-speed/haste reconstruction.
-- [x] Make press tracking timestamp-only.
-- [x] Remove combat-log and `UI_ERROR_MESSAGE` failure inference.
-- [x] Gate overlay spell IDs and bound diagnostic history.
-- [x] Replace obsolete `GetMouseFocus` logic.
-- [x] Make Core the only `/gcdopt` owner.
-- [x] Exclude `GCDOptimizer_Test.lua` from the production TOC and move it to `/gcdopttest`.
-- [x] Preserve compatible SavedVariables through schema-owned migration.
-- [x] Run syntax and forbidden-symbol checks for every changed runtime Lua file.
+- [x] Keep one production `/gcdopt` dispatcher.
+- [x] Preserve compatible SavedVariables through schema migration.
+- [x] Keep press hooks timestamp-only.
+- [x] Remove combat-log and raw UI-error failure inference.
+- [x] Remove obsolete `GetMouseFocus` use.
+- [x] Keep detector/HUD work segment-scoped.
 
-## Required in-game release gate
+## Regression repair
 
-Record exact client version, build, Interface, date, and restriction context for every result.
+- [x] Restore the known `baseSwing/currentSwing` GCD estimator.
+- [x] Restore the event-derived candidate-start fallback.
+- [x] Remove the pending direct-only migration workflow/script.
+- [x] Correct direct-only documentation.
 
-- [ ] Fresh login and `/reload`: no Lua errors, taint errors, forbidden-object errors, or repeating callbacks.
-- [ ] Verify `/gcdopt`, `show`, `hide`, `start`, `stop`, `reset`, `minimap show/hide`, `debug`, `anchors`, and `help`.
-- [ ] Verify minimap left-click, right-click, and shift-right-click behavior.
-- [ ] Verify auto combat start/stop and replacement of a running manual segment.
-- [ ] Verify reset preserves running/auto state and settings survive `/reload`.
-- [ ] Test an ordinary haste-scaled GCD spec and a one-second-GCD spec.
-- [ ] Mix off-GCD abilities into the rotation and confirm they never add GCD starts.
-- [ ] Test instant, cast-time, channelled, empowered, macro, spellbook, item, and action-bar use paths.
-- [ ] Change `SpellQueueWindow` and verify queue/late classifications and recommendation stability.
-- [ ] Test combat, encounter, Mythic+, arena, and battleground restriction states.
-- [ ] Trigger or observe `SPELL_SECRECY_CHANGED` during a segment.
-- [ ] Confirm inaccessible `61304` data fails closed without Lua errors or fabricated timing.
-- [ ] Hide/show the HUD repeatedly and run a long segment to confirm ticker cleanup and stable CPU/GC behavior.
-- [ ] Compare HUD totals with a recorded manual timeline and `/gcdopt debug` output.
+## Required hardening
 
-This matrix remains tracked by GitHub issue #1 and must be completed before packaging the release.
+- [ ] Centralize accessibility checks for both `61304` numeric fields and `UnitAttackSpeed` without removing either source.
+- [ ] Preserve swing calibration across reset/start boundaries correctly.
+- [ ] Detect weapon swaps and attack-speed-only modifiers; recalibrate or downgrade confidence.
+- [ ] Calibrate one-second base-GCD specs rather than silently using `1.5`.
+- [ ] Distinguish `DIRECT_EXACT`, `ESTIMATED_SWING`, and `CACHED_LOW_CONFIDENCE` in metric records and HUD/debug output.
+- [ ] Prevent off-GCD `UNIT_SPELLCAST_SUCCEEDED` events from becoming exact GCD cycles.
+- [ ] Validate instant, cast-time, channelled, and empowered event timing separately.
+- [ ] Exclude estimated and ambiguous samples from exact latency/SQW recommendations.
+- [ ] Add deterministic tests for direct-to-estimated transitions and duplicate suppression.
+
+## Current-client release gate
+
+Record exact version, build, Interface, date, content type, restriction state, and taint state.
+
+- [ ] Outside combat: probe `61304` policy and numeric accessibility.
+- [ ] Open-world combat: repeat the probe and capture attack-speed accessibility.
+- [ ] Encounter and Mythic+: repeat.
+- [ ] Arena and battleground: repeat.
+- [ ] Trigger/observe `SPELL_SECRECY_CHANGED`.
+- [ ] Test ordinary and one-second-GCD specs.
+- [ ] Test weapon swaps, haste changes, and attack-speed-only effects.
+- [ ] Mix off-GCD actions into every rotation.
+- [ ] Compare exact/estimated cycle counts against a recorded manual timeline.
+- [ ] Verify login, `/reload`, controls, minimap, persistence, ticker cleanup, and no Lua/taint errors.
+
+Issues #1 and #5 are release blockers. Do not package a release until both evidence and behavior are resolved.

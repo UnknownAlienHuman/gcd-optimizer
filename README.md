@@ -1,19 +1,17 @@
 # GCD Optimizer
 
-GCD Optimizer is a lightweight World of Warcraft HUD for reviewing global-cooldown cadence, queue-window coverage, late input, idle gaps, and server-delay symptoms.
+GCD Optimizer is a World of Warcraft HUD for reviewing global-cooldown cadence, queue-window coverage, late input, idle gaps, and server-delay symptoms.
 
-![GCD Optimizer timing HUD](https://media.forgecdn.net/attachments/1510/156/screenshot-2026-02-02-054015-png.png)
+## Current source state
 
-Screenshot from the [CurseForge gallery](https://www.curseforge.com/wow/addons/gcd-optimizer).
-
-## Current release
-
-- Game: Retail 12.1.0
+- Game target: Retail 12.1.0
 - Interface: `120100`
 - Addon version: `0.5.0-midnight-12.1`
 - Author: Neomorph
 - Saved variables: `GCDOptimizerDB`
-- Engineering baseline: Blizzard UI source `12.1.0.69497`, commit `027d26c3406d3de2cbd2b1f67d468fe033a1bcd4`, reviewed 2026-08-27
+- Blizzard UI baseline: `12.1.0.69497`, `Gethe/wow-ui-source@027d26c3406d3de2cbd2b1f67d468fe033a1bcd4`
+
+The repository is **not yet a packaged release candidate**. Current-client verification is tracked by issues #1 and #5.
 
 ## Installation
 
@@ -23,7 +21,7 @@ Copy the `GCDOptimizer` directory into:
 World of Warcraft/_retail_/Interface/AddOns/
 ```
 
-Restart the client or run `/reload`. LibStub, CallbackHandler, LibDataBroker, and LibDBIcon are bundled under `libs/`.
+Restart the client or run `/reload`. Bundled libraries live under `libs/`.
 
 ## Controls
 
@@ -32,51 +30,72 @@ Restart the client or run `/reload`. LibStub, CallbackHandler, LibDataBroker, an
 - Shift-right-click the minimap icon: reset the current segment while preserving its running state.
 - Right-click the HUD: open its runtime menu.
 
-The single slash-command dispatcher supports:
-
 ```text
 /gcdopt
-/gcdopt show
-/gcdopt hide
-/gcdopt start
-/gcdopt stop
-/gcdopt reset
-/gcdopt minimap show
-/gcdopt minimap hide
-/gcdopt debug
-/gcdopt anchors
-/gcdopt help
+/gcdopt show | hide
+/gcdopt start | stop | reset
+/gcdopt minimap show | hide
+/gcdopt debug | anchors | help
 ```
 
-## Retail 12.1 data model
+## GCD observation model
 
-The addon reads the GCD dummy spell (`61304`) only through a centralized accessibility gate. A successful player cast requests an immediate cooldown read but is not itself counted as a new GCD; this prevents off-GCD abilities from inflating the sample.
+The addon must support more than one evidence mode.
 
-Input hooks discard all arguments and retain only ordinary local timestamps. The addon does not persist spell IDs, spell names, macro text, targets, cast GUIDs, or other protected input payloads in metrics state.
+### Exact mode
 
-When the GCD cooldown is inaccessible, timing detection fails closed and the HUD retains only the last ordinary duration observed in the current session. No alternate combat API is used to reconstruct hidden state.
+When ordinary numeric fields from `C_Spell.GetSpellCooldown(61304)` are readable, the detector uses the reported cooldown start and duration and deduplicates starts by time.
 
-Failure diagnostics count player cast failures without parsing `UI_ERROR_MESSAGE`, combat-log data, targets, resources, or restricted text. In 12.1 the displayed reason is therefore intentionally generic unless Blizzard exposes a safe source in a future contract.
+### Estimated combat fallback
+
+The original Midnight implementation exists because the numerical `61304` cooldown was observed or expected to become Secret in combat. When the direct duration cannot be used, the estimator falls back to:
+
+1. an out-of-combat `UnitAttackSpeed("player")` baseline;
+2. the `baseSwing / currentSwing` ratio as a haste proxy;
+3. cast-to-cast EWMA as a conservative correction;
+4. the last stable estimate.
+
+`UNIT_SPELLCAST_SUCCEEDED` supplies a non-Secret local timestamp for the legacy fallback detector. This path is estimated, not equivalent to an authoritative cooldown start.
+
+### Unresolved evidence conflict
+
+Blizzard-origin notes and WoWUIDev discussions describe spell `61304` as intentionally whitelisted/non-secret. The project history says the numerical cooldown still became Secret in combat and motivated the swing-speed redesign. The exact build, restriction state, and taint context of that observation have not yet been recovered.
+
+Therefore:
+
+- the direct source remains preferred whenever accessible;
+- the attack-speed fallback must not be removed solely because a whitelist was documented;
+- direct and estimated samples must eventually be labeled separately;
+- current-build combat, encounter, Mythic+, arena, and battleground probes remain mandatory.
+
+## Known limitations of the restored fallback
+
+- `UnitAttackSpeed` is itself restriction-sensitive and must be rejected when inaccessible.
+- Weapon changes and attack-speed modifiers may not represent spell GCD haste exactly.
+- One-second base-GCD specs require correct baseline calibration.
+- `UNIT_SPELLCAST_SUCCEEDED` can fire for off-GCD actions and at different points for instant, cast-time, and channelled spells.
+- Current metrics do not yet separate exact, estimated, and ambiguous samples.
+
+The restored code prevents the direct-only regression, but these points remain release blockers rather than being hidden behind confident labels.
+
+## Other security boundaries
+
+Input hooks retain local timestamps only. Metrics do not persist action slots, macro text, spell names, targets, cast GUIDs, or protected payloads. Failure diagnostics avoid combat-log and raw UI-error inference.
 
 ## Saved-variable upgrades
 
-Version updates now merge compatible defaults into `GCDOptimizerDB` instead of erasing user settings whenever the release string changes. Destructive changes, if ever required, are owned by an explicit schema migration.
+Compatible settings are merged into `GCDOptimizerDB`. Release strings no longer erase the user's configuration; incompatible changes require an explicit schema migration.
 
-## Development and verification
+## Development
 
+- [Retail 12.1 engineering notes](README_MIDNIGHT.md)
+- [Runtime evidence contract](GCD_RUNTIME_EVIDENCE.md)
 - [Architecture](ARCHITECTURE.md)
 - [Code index](CODE_INDEX.md)
 - [Code graph](CODE_GRAPH.md)
-- [Retail 12.1 implementation notes](README_MIDNIGHT.md)
 - [Changelog](CHANGELOG.md)
 - [Release checklist](todo.md)
 - [WoW addon engineering knowledge base](https://github.com/UnknownAlienHuman/wow-addon-engineering-kb)
-
-Static source validation is part of this repository update. A current-client combat smoke test remains mandatory before publishing a packaged release; it is tracked in GitHub issue #1.
-
-## Published addon
-
-[CurseForge: GCD Optimizer](https://www.curseforge.com/wow/addons/gcd-optimizer)
 
 ## License
 
