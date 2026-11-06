@@ -1,11 +1,7 @@
 -- GCDOptimizer_Metrics.lua
--- Metrics v7: REAL presses + queue/late + server delay hints
--- Removes: PDG
--- Adds:
---   QC%   (Queue Coverage): any press in [ready-SQW, ready] regardless of late
---   AFKp% (AFK Press): among cycles with gap > MicroCap, any press in [ready+MicroCap, start]
--- Keeps:
---   SDq>0%: share of queued cycles with StartDelay(q) > epsilon
+-- Source-aware cadence and input analytics. Estimated starts remain useful for
+-- approximate cadence, but only exact-to-exact cycles with one unambiguous
+-- local press may feed latency and SpellQueueWindow recommendations.
 
 local _, NS = ...
 local U = NS.Util
@@ -13,116 +9,106 @@ local U = NS.Util
 NS.Metrics = NS.Metrics or {}
 local M = NS.Metrics
 
-local function DequeToArray(dq)
-  local arr = {}
-  for v in dq:Iter() do arr[#arr + 1] = v end
-  return arr
+local function Now()
+  return GetTime()
 end
 
-local function PushLimited(dq, v, maxN)
-  dq:PushBack(v)
-  while dq:Size() > maxN do dq:PopFront() end
+local function DequeToArray(deque)
+  local values = {}
+  if not deque then return values end
+  for value in deque:Iter() do values[#values + 1] = value end
+  return values
+end
+
+local function PushLimited(deque, value, maximum)
+  deque:PushBack(value)
+  while deque:Size() > maximum do deque:PopFront() end
+end
+
+local function ClearArray(values)
+  for index = #values, 1, -1 do values[index] = nil end
 end
 
 local function SafeGetCVarNumber(name, fallback)
-  local v = GetCVar(name)
-  local n = tonumber(v)
-  if not n then return fallback end
-  return n
+  local value = GetCVar(name)
+  local number = tonumber(value)
+  if not number then return fallback end
+  return number
 end
 
-local function GetDynamicMicroCap(cfg)
-  local sqwMs = SafeGetCVarNumber("SpellQueueWindow", 400)
-  local sqw = sqwMs / 1000
-  local margin = cfg.microCapMargin; if margin == nil then margin = 0.05 end
-  local minV = cfg.microCapMin; if minV == nil then minV = 0.10 end
-  local maxV = cfg.microCapMax; if maxV == nil then maxV = 0.40 end
-  return U.Clamp(sqw + margin, minV, maxV), sqw, sqwMs
+local function GetDynamicMicroCap(config)
+  local queueWindow = SafeGetCVarNumber("SpellQueueWindow", 400) / 1000
+  local margin = config.microCapMargin
+  if margin == nil then margin = 0.05 end
+  local minimum = config.microCapMin
+  if minimum == nil then minimum = 0.10 end
+  local maximum = config.microCapMax
+  if maximum == nil then maximum = 0.40 end
+  return U.Clamp(queueWindow + margin, minimum, maximum)
 end
 
-local function FindFirstPressBetween(self, tA, tB)
-  for e in self.pressQueue:Iter() do
-    if e.t >= tA and e.t <= tB then return e end
-  end
-  return nil
+local function ValidTiming(value)
+  return U.IsFiniteNumber(value) and value > 0
 end
 
-local function FindLastPressBetween(self, tA, tB)
-  local last = nil
-  for e in self.pressQueue:Iter() do
-    if e.t >= tA and e.t <= tB then last = e end
-  end
-  return last
+local function PercentileSorted(values, percentile)
+  local count = #values
+  if count == 0 then return 0 end
+  local index = math.floor(U.Clamp(percentile, 0, 1) * (count - 1) + 1)
+  return values[index] or 0
 end
 
-
-local function CountPressBetween(self, tA, tB)
-  local n = 0
-  for e in self.pressQueue:Iter() do
-    if e.t >= tA and e.t <= tB then n = n + 1 end
-  end
-  return n
+local function MedianSorted(values)
+  local count = #values
+  if count == 0 then return 0 end
+  local middle = math.floor((count + 1) / 2)
+  if (count % 2) == 1 then return values[middle] or 0 end
+  return ((values[middle] or 0) + (values[middle + 1] or 0)) / 2
 end
 
--- Reuse small arrays in hot paths to reduce GC pressure.
-local function ClearArray(t)
-  for i = #t, 1, -1 do t[i] = nil end
-end
-
--- Percentile/median for arrays that we are allowed to sort in-place.
-local function PercentileSorted(arr, p)
-  local n = #arr
-  if n == 0 then return 0 end
-  local idx = math.floor(U.Clamp(p, 0, 1) * (n - 1) + 1)
-  return arr[idx] or 0
-end
-
-local function MedianSorted(arr)
-  local n = #arr
-  if n == 0 then return 0 end
-  local mid = math.floor((n + 1) / 2)
-  if (n % 2) == 1 then
-    return arr[mid] or 0
-  end
-  return ((arr[mid] or 0) + (arr[mid + 1] or 0)) / 2
-end
-
-
--- Estimate "system delay" between the moment the GCD becomes ready and when we observe
--- UNIT_SPELLCAST_SUCCEEDED for the next GCD-triggering spell.
---
--- Why:
---   rawGap = start - ready includes network/processing jitter. If we treat it as AFK,
---   we will falsely mark good queued gameplay as "sleeping" on higher ping.
---
--- Strategy:
---   Prefer empirical median from queued-classified cycles (startDelayQueued deque).
---   Fallback: derive from current latency (GetNetStats), using a conservative one-way estimate.
-local function EstimateSystemDelaySec(self, cfg)
-  -- Empirical: median startDelayQueued (seconds). Needs a few samples to be stable.
-  local arr = DequeToArray(self.startDelayQueued or U.Deque:New())
-  if #arr >= (cfg.sysDelayMinSamples or 6) then
-    local m = U.Median(arr)
-    if m and m > 0 and m < 1.0 then
-      return m
+local function EstimateSystemDelaySec(self, config)
+  local samples = DequeToArray(self.startDelayQueued)
+  if #samples >= (config.sysDelayMinSamples or 6) then
+    table.sort(samples)
+    local median = MedianSorted(samples)
+    if median > 0 and median < 1 then
+      return median
     end
   end
 
-  -- Fallback from ping.
   local _, _, home, world = GetNetStats()
-  local latMs = 0
+  local latency = 0
   if home and world then
-    latMs = math.max(tonumber(home) or 0, tonumber(world) or 0)
+    latency = math.max(tonumber(home) or 0, tonumber(world) or 0)
   else
-    latMs = tonumber(world) or tonumber(home) or 0
+    latency = tonumber(world) or tonumber(home) or 0
   end
 
-  -- One-way-ish estimate. Factor < 1 because SpellQueueWindow pre-queues before ready.
-  local f = cfg.sysDelayLatencyFactor
-  if f == nil then f = 0.50 end
-  local s = (latMs * f) / 1000
-  -- Clamp to sane range; avoid zero to prevent divide-by-zero style pathologies.
-  return U.Clamp(s, 0.01, 0.30)
+  local factor = config.sysDelayLatencyFactor
+  if factor == nil then factor = 0.50 end
+  local estimate = U.Clamp((latency * factor) / 1000, 0.01, 0.30)
+  return estimate
+end
+
+local function CountPresses(self, startTime, readyTime, endTime)
+  local total, queued, late = 0, 0, 0
+  local onlyPress = nil
+  for press in self.pressQueue:Iter() do
+    local timestamp = press.t
+    if timestamp >= startTime and timestamp <= endTime then
+      total = total + 1
+      onlyPress = press
+      if timestamp <= readyTime then queued = queued + 1 else late = late + 1 end
+    end
+  end
+  return total, queued, late, onlyPress
+end
+
+local function HasPressBetween(self, startTime, endTime)
+  for press in self.pressQueue:Iter() do
+    if press.t >= startTime and press.t <= endTime then return true end
+  end
+  return false
 end
 
 function M:Reset()
@@ -132,521 +118,342 @@ function M:Reset()
   self.segmentEndEffective = nil
 
   self.actualFight = 0
+  self.directStarts = 0
+  self.estimatedStarts = 0
+  self.ineligibleCycles = 0
 
   self.lastGCDStart = nil
   self.lastGCDDur = nil
+  self.lastGCDSource = nil
   self.lastReadyTime = nil
+  self.lastPressAt = nil
 
-  self.wasteMicroTime = 0
-  self.afkTime = 0
-  self.tailTime = 0
+  self.upgradePreviousStart = nil
+  self.upgradePreviousDuration = nil
+  self.upgradePreviousSource = nil
+
   self.wastedGCD = 0
 
-  -- lost GCDs by confirmed cycle length (true "missed globals")
-  self.lostTime = 0
-  self.lostGcd = 0
-
-  self.gcdStarts = U.Deque:New()
-  self.intervals = U.Deque:New()
   self.gapFull = U.Deque:New()
-
-  -- breakdown samples (seconds)
-  self.queueLead = U.Deque:New()        -- ready - press (queued-classified)
-  self.startDelayQueued = U.Deque:New() -- start - ready (queued-classified)
-  self.latePress = U.Deque:New()        -- press - ready (late-classified)
-  self.afterPressLate = U.Deque:New()   -- start - press (late-classified)
-
-  -- per-cycle snapshots for SQW recommendation (seconds)
-  -- each: {ready=number, start=number, presses={t1,t2,...}}
+  self.queueLead = U.Deque:New()
+  self.startDelayQueued = U.Deque:New()
+  self.latePress = U.Deque:New()
   self.cycleData = U.Deque:New()
-
-  -- per-cycle compact log for rolling window analytics
-  -- each: {t=start, prevDur=, delta=, lost=, delay=, class=, noPress=bool, qCov=bool, qMulti=bool,
-  --        late=bool, lateDelay=, afterLate=, qDelay=}
   self.cycleLog = U.Deque:New()
+  self.pressQueue = U.Deque:New()
 
-  -- counts (classified)
   self.cycleN = 0
   self.queuedN = 0
   self.lateN = 0
   self.noneN = 0
-
-  -- NEW: coverage / AFK-press
-  self.queueCovN = 0        -- any press in [ready-SQW, ready] (even if late later)
-  self.queueMultiN = 0      -- 2+ presses in [ready-SQW, ready] (over-queue risk)
-  self.afkGapN = 0          -- cycles with gap > MicroCap
-  self.afkGapPressN = 0     -- those cycles where press in [ready+MicroCap, start]
-
-  -- server delay non-zero share among queued-classified
-  self.queuedDelayNonZeroN = 0
-
-  -- press queue
-  self.pressQueue = U.Deque:New() -- {t=, kind=, id=}
+  self.ambiguousN = 0
+  self.attributableN = 0
+  self.queueCovN = 0
+  self.afkGapN = 0
+  self.afkGapPressN = 0
 end
 
-function M:OnSegmentStart(t0)
+function M:OnSegmentStart(startTime)
   self:Reset()
   self.inSegment = true
-  self.segmentStart = t0
+  self.segmentStart = startTime
 end
 
-function M:OnSegmentEnd(t1)
+function M:OnSegmentEnd(endTime)
   self.inSegment = false
-  self.segmentEnd = t1
+  self.segmentEnd = endTime
 
-  -- Effective end: cut idle tail after the last meaningful input/action for the final report.
-  -- We use max(last GCD start, last press attempt) to avoid cutting off a queued final start.
-  local effEnd = t1
+  local effectiveEnd = endTime
   local lastAction = 0
   if self.lastGCDStart and self.lastGCDStart > lastAction then lastAction = self.lastGCDStart end
   if self.lastPressAt and self.lastPressAt > lastAction then lastAction = self.lastPressAt end
-  if lastAction > 0 and effEnd and effEnd > lastAction then
-    effEnd = lastAction
-  end
-  if self.segmentStart and effEnd and effEnd < self.segmentStart then
-    effEnd = self.segmentStart
-  end
-  self.segmentEndEffective = effEnd
-
-  -- Tail time is kept for display, but NOT added into AFK in final report
-  -- because we cut it via segmentEndEffective.
-  self.tailTime = 0
+  if lastAction > 0 and effectiveEnd > lastAction then effectiveEnd = lastAction end
+  if self.segmentStart and effectiveEnd < self.segmentStart then effectiveEnd = self.segmentStart end
+  self.segmentEndEffective = effectiveEnd
 end
 
 function M:GetEffectiveEnd(now)
-  if self.inSegment then return now or GetTime() end
-  return self.segmentEndEffective or self.segmentEnd or (now or GetTime())
+  if self.inSegment then return now or Now() end
+  return self.segmentEndEffective or self.segmentEnd or now or Now()
 end
 
-function M:ReanchorStart(newStart)
-  self.segmentStart = newStart
+function M:ReanchorStart(startTime)
+  self.segmentStart = startTime
 end
 
-function M:OnPress(now, kind, id)
+function M:OnPress(timestamp)
   if not self.inSegment then return end
 
-  local cfg = NS:GetConfig()
-  local bufSec = cfg.pressBufferSeconds or 8.0
-  local bufMax = cfg.pressBufferMax or 1200
+  local config = NS:GetConfig()
+  local keepSeconds = config.pressBufferSeconds or 8.0
+  local maximum = config.pressBufferMax or 1200
 
-  self.pressQueue:PushBack({ t = now, kind = kind, id = id })
-
-  self.lastPressAt = now
-
-  self.pressQueue:PopFrontWhile(function(e)
-    return e.t < (now - bufSec)
+  self.pressQueue:PushBack({ t = timestamp })
+  self.lastPressAt = timestamp
+  self.pressQueue:PopFrontWhile(function(press)
+    return press.t < (timestamp - keepSeconds)
   end)
-
-  while self.pressQueue:Size() > bufMax do
-    self.pressQueue:PopFront()
-  end
+  while self.pressQueue:Size() > maximum do self.pressQueue:PopFront() end
 end
 
-function M:OnGCDStart(gcdStart, gcdDurObserved)
-  if not self.inSegment then return end
+function M:AnalyzeExactCycle(previousStart, previousDuration, currentStart)
+  if not (ValidTiming(previousStart) and ValidTiming(previousDuration) and ValidTiming(currentStart)) then return end
 
-  local cfg = NS:GetConfig()
-  local statN = cfg.statWindowN or 60
+  local delta = currentStart - previousStart
+  if delta <= 0 or delta >= 10 then return end
+
+  local config = NS:GetConfig()
+  local statisticLimit = config.statWindowN or 60
+  self.cycleN = self.cycleN + 1
+
+  local ready = previousStart + previousDuration
+  local rawGap = math.max(0, currentStart - ready)
+  local systemDelay = EstimateSystemDelaySec(self, config)
+  local delay = math.max(0, rawGap - systemDelay)
+  PushLimited(self.gapFull, delay, statisticLimit)
+
+  local cap = config.dynamicMicroCap == false
+    and (config.microCap or 0.20)
+    or GetDynamicMicroCap(config)
+  local micro = math.min(delay, cap)
+  local afk = math.max(0, delay - micro)
+  self.wastedGCD = self.wastedGCD + (micro / previousDuration)
+
+  local queueWindow = math.max(0, SafeGetCVarNumber("SpellQueueWindow", 400) / 1000)
+  -- Do not let an oversized CVar reach into the previous action that started
+  -- this GCD. The next-action attribution window begins strictly after the
+  -- previous start, even when a user or external addon sets an extreme value.
+  local attributionStart = math.max(previousStart + 0.001, ready - queueWindow)
+  local candidateCount, queuedCount, _, onlyPress = CountPresses(
+    self,
+    attributionStart,
+    ready,
+    currentStart
+  )
+
+  local queueCovered = queuedCount > 0
+  if queueCovered then self.queueCovN = self.queueCovN + 1 end
+
+  local queued = false
+  local late = false
+  local lateDelay = 0
+  local queueDelay = nil
+
+  if candidateCount == 0 then
+    self.noneN = self.noneN + 1
+  elseif candidateCount > 1 then
+    self.ambiguousN = self.ambiguousN + 1
+  else
+    self.attributableN = self.attributableN + 1
+    if onlyPress.t <= ready then
+      queued = true
+      self.queuedN = self.queuedN + 1
+      local lead = math.max(0, ready - onlyPress.t)
+      queueDelay = rawGap
+      PushLimited(self.queueLead, lead, statisticLimit)
+      PushLimited(self.startDelayQueued, rawGap, statisticLimit)
+    else
+      late = true
+      self.lateN = self.lateN + 1
+      lateDelay = math.max(0, onlyPress.t - ready)
+      PushLimited(self.latePress, lateDelay, statisticLimit)
+    end
+
+    PushLimited(self.cycleData, {
+      ready = ready,
+      start = currentStart,
+      press = onlyPress.t,
+    }, statisticLimit)
+  end
+
+  local isAfkGap = delay > (cap + 1e-6)
+  local afkPress = false
+  if isAfkGap then
+    afkPress = HasPressBetween(self, ready + cap, currentStart)
+    self.afkGapN = self.afkGapN + 1
+    if afkPress then self.afkGapPressN = self.afkGapPressN + 1 end
+  end
+
+  PushLimited(self.cycleLog, {
+    t = currentStart,
+    delay = delay,
+    afk = afk,
+    qCov = queueCovered,
+    queued = queued,
+    late = late,
+    lateDelay = lateDelay,
+    qDelay = queueDelay,
+    afkGap = isAfkGap,
+    afkPress = afkPress,
+  }, 600)
+end
+
+function M:OnGCDStart(startTime, duration, source)
+  if not self.inSegment then return end
+  if not (ValidTiming(startTime) and ValidTiming(duration)) then return end
+  if source ~= U.GCD_SOURCE_DIRECT and source ~= U.GCD_SOURCE_ESTIMATED then return end
+
+  local previousStart = self.lastGCDStart
+  local previousDuration = self.lastGCDDur
+  local previousSource = self.lastGCDSource
 
   self.actualFight = self.actualFight + 1
-  self.gcdStarts:PushBack(gcdStart)
-
-  if self.lastGCDStart then
-    local delta = gcdStart - self.lastGCDStart
-    if delta > 0 and delta < 10 then
-      self.cycleN = (self.cycleN or 0) + 1
-      PushLimited(self.intervals, delta, statN)
-
-      local prevDur = self.lastGCDDur or 0
-      -- True lost GCDs from cycle length. Uses confirm-to-confirm distance only.
-      -- lostG = floor(delta / prevDur) - 1 (clamped), where prevDur is our last observed/predicted GCD.
-      if prevDur and prevDur > 0 then
-        local lost = math.floor((delta + 1e-6) / prevDur) - 1
-        if lost < 0 then lost = 0 end
-        -- Allow large downtime to be reflected in LostG (used for training).
-        -- Keep a high cap to prevent numeric blowups from extreme edge cases.
-        if lost > 30 then lost = 30 end
-        self.lostGcd = (self.lostGcd or 0) + lost
-        self.lostTime = (self.lostTime or 0) + (lost * prevDur)
-      end
-
-      local ready = self.lastGCDStart + prevDur
-      self.lastReadyTime = ready
-
-      local rawGap = gcdStart - ready
-      if rawGap < 0 then rawGap = 0 end
-
-      -- microcap
-      local capSec
-      if cfg.dynamicMicroCap == false then
-        capSec = cfg.microCap or 0.20
-      else
-        capSec = select(1, GetDynamicMicroCap(cfg))
-      end
-
-      -- SQW
-      local sqwMs = SafeGetCVarNumber("SpellQueueWindow", 400)
-      local sqwSec = sqwMs / 1000
-
-      -- Snapshot press times around this cycle for later SQW recommendation.
-      do
-        local snap = { ready = ready, start = gcdStart, presses = {} }
-        local tMin = ready - 0.60 -- cover up to 400ms queue + margin
-        for e in self.pressQueue:Iter() do
-          if e.t >= tMin and e.t <= gcdStart then
-            snap.presses[#snap.presses + 1] = e.t
-          end
-        end
-        PushLimited(self.cycleData, snap, statN)
-      end
-
-      -- Coverage: any press in queue window (even if later becomes "late")
-      local qP = FindLastPressBetween(self, ready - sqwSec, ready)
-if qP then
-  self.queueCovN = (self.queueCovN or 0) + 1
-  local k = CountPressBetween(self, ready - sqwSec, ready)
-  if k >= 2 then
-    self.queueMultiN = (self.queueMultiN or 0) + 1
+  if source == U.GCD_SOURCE_DIRECT then
+    self.directStarts = self.directStarts + 1
+  else
+    self.estimatedStarts = self.estimatedStarts + 1
   end
-end
+  self.upgradePreviousStart = previousStart
+  self.upgradePreviousDuration = previousDuration
+  self.upgradePreviousSource = previousSource
 
-
-      -- Classification (late > queued > none), but reuse qP computed above
-      local lateP = FindFirstPressBetween(self, ready, gcdStart)
-      local class = "none"
-      if lateP then class = "late" elseif qP then class = "queued" end
-
-      -- System delay compensation.
-      -- rawGap = start - ready includes network/processing jitter. We remove an estimate of that
-      -- before using the gap for player-skill metrics.
-      local sysDelay = EstimateSystemDelaySec(self, cfg)
-      local delay = rawGap - sysDelay
-      if delay < 0 then delay = 0 end
-
-      -- Store (delay) for HUD (Gap90) and downstream analysis.
-      PushLimited(self.gapFull, delay, statN)
-      -- Micro/AFK breakdown (matches the user guide):
-      -- delay = max(0, (start - ready) - sysDelay). This is the player-visible "gap" after GCD becomes ready.
-      -- micro = small part of delay (capped by MicroCap); AFK = the remainder of delay beyond MicroCap.
-      local micro = delay
-      if micro > capSec then micro = capSec end
-      local afk = delay - micro
-      if afk < 0 then afk = 0 end
-
-      -- AFK-gap diagnostic: for cycles with a real AFK component (delay > MicroCap),
-      -- did the player press during the AFK portion [ready+MicroCap, start]?
-      local isAfkGap = delay > (capSec + 1e-6)
-      local afkPress = false
-      if isAfkGap then
-        local afkStart = ready + capSec
-        if afkStart < gcdStart and FindFirstPressBetween(self, afkStart, gcdStart) then
-          afkPress = true
-        end
-      end
-
-      -- Rolling analytics log (compact per-cycle record)
-      do
-        local lost = 0
-        if prevDur and prevDur > 0 then
-          lost = math.floor((delta + 1e-6) / prevDur) - 1
-          if lost < 0 then lost = 0 end
-          if lost > 30 then lost = 30 end
-        end
-        local qDelay = (class == "queued") and rawGap or nil
-        local lateDelay = (lateP and (lateP.t - ready)) or 0
-        local afterLate = (lateP and (gcdStart - lateP.t)) or 0
-        PushLimited(self.cycleLog, {
-          t = gcdStart,
-          prevDur = prevDur,
-          delta = delta,
-          lost = lost,
-          delay = delay,
-          capSec = capSec,
-          micro = micro,
-          afk = afk,
-          class = class,
-          noPress = (class == "none"),
-          qCov = (qP ~= nil),
-          qMulti = (qP ~= nil) and (CountPressBetween(self, ready - sqwSec, ready) >= 2) or false,
-          late = (class == "late"),
-          lateDelay = lateDelay,
-          afterLate = afterLate,
-          qDelay = qDelay,
-          afkGap = isAfkGap,
-          afkPress = afkPress,
-        }, 600)
-      end
-
-      self.wasteMicroTime = self.wasteMicroTime + micro
-      self.afkTime = self.afkTime + afk
-      if prevDur and prevDur > 0 then
-        -- WstG = player-induced gap in "GCD equivalents" (not counting system delay).
-        self.wastedGCD = self.wastedGCD + (micro / prevDur)
-      end
-      -- AFKp% semantics:
-      -- Consider cycles with a real AFK component (delay > MicroCap). AFKp answers:
-      -- "During those AFK gaps, did you press at least once (after MicroCap)?".
-      if isAfkGap then
-        self.afkGapN = (self.afkGapN or 0) + 1
-        if afkPress then
-          self.afkGapPressN = (self.afkGapPressN or 0) + 1
-        end
-      end
-
-      if class == "late" then
-        self.lateN = (self.lateN or 0) + 1
-
-        local late = lateP.t - ready
-        local after = gcdStart - lateP.t
-        if late < 0 then late = 0 end
-        if after < 0 then after = 0 end
-
-        PushLimited(self.latePress, late, statN)
-        PushLimited(self.afterPressLate, after, statN)
-      elseif class == "queued" then
-        self.queuedN = (self.queuedN or 0) + 1
-
-        local lead = ready - qP.t
-        local sd = rawGap
-        if lead < 0 then lead = 0 end
-        if sd < 0 then sd = 0 end
-
-        PushLimited(self.queueLead, lead, statN)
-        PushLimited(self.startDelayQueued, sd, statN)
-
-        local eps = 0.002 -- 2ms
-        if sd > eps then
-          self.queuedDelayNonZeroN = (self.queuedDelayNonZeroN or 0) + 1
-        end
-      else
-        self.noneN = (self.noneN or 0) + 1
-      end
+  if previousStart then
+    if previousSource == U.GCD_SOURCE_DIRECT and source == U.GCD_SOURCE_DIRECT then
+      self:AnalyzeExactCycle(previousStart, previousDuration, startTime)
+    else
+      self.ineligibleCycles = self.ineligibleCycles + 1
     end
   end
 
-  self.lastGCDStart = gcdStart
-  self.lastGCDDur = gcdDurObserved or 0
-  self.lastReadyTime = self.lastGCDStart + (self.lastGCDDur or 0)
+  self.lastGCDStart = startTime
+  self.lastGCDDur = duration
+  self.lastGCDSource = source
+  self.lastReadyTime = startTime + duration
 end
 
--- Build a context snapshot for HUD/analysis.
--- If windowSec is provided, aggregates only cycles with start time in [end-windowSec, end].
--- If cutoffEnd is provided, ignores cycles after cutoffEnd (used for final report tail-cut).
-function M:ComputeContext(windowSec, now, cutoffEnd)
-  now = now or GetTime()
-  local tEnd = cutoffEnd or self:GetEffectiveEnd(now)
-  local t0 = self.segmentStart or tEnd
-  local tStart = t0
-  if windowSec and windowSec > 0 then
-    tStart = math.max(t0, tEnd - windowSec)
+function M:RefreshLastGCD(startTime, duration, source)
+  if source ~= U.GCD_SOURCE_DIRECT then return false end
+  if self.lastGCDSource ~= U.GCD_SOURCE_DIRECT then return false end
+  if not (ValidTiming(startTime) and ValidTiming(duration)) then return false end
+  if math.abs((self.lastGCDStart or 0) - startTime) > 0.05 then return false end
+
+  self.lastGCDDur = duration
+  self.lastReadyTime = self.lastGCDStart + duration
+  return true
+end
+
+function M:UpgradeLastGCD(oldStart, newStart, duration, source)
+  if source ~= U.GCD_SOURCE_DIRECT then return false end
+  if self.lastGCDSource ~= U.GCD_SOURCE_ESTIMATED then return false end
+  if not (ValidTiming(oldStart) and ValidTiming(newStart) and ValidTiming(duration)) then return false end
+  if math.abs((self.lastGCDStart or 0) - oldStart) > 0.05 then return false end
+
+  self.estimatedStarts = math.max(0, self.estimatedStarts - 1)
+  self.directStarts = self.directStarts + 1
+
+  self.lastGCDStart = newStart
+  self.lastGCDDur = duration
+  self.lastGCDSource = source
+  self.lastReadyTime = newStart + duration
+
+  if self.upgradePreviousStart and self.upgradePreviousSource == U.GCD_SOURCE_DIRECT then
+    self.ineligibleCycles = math.max(0, self.ineligibleCycles - 1)
+    self:AnalyzeExactCycle(
+      self.upgradePreviousStart,
+      self.upgradePreviousDuration,
+      newStart
+    )
+  end
+  return true
+end
+
+function M:ComputeContext(windowSeconds, now, cutoffEnd)
+  now = now or Now()
+  local endTime = cutoffEnd or self:GetEffectiveEnd(now)
+  local segmentStart = self.segmentStart or endTime
+  local startTime = segmentStart
+  if windowSeconds and windowSeconds > 0 then
+    startTime = math.max(segmentStart, endTime - windowSeconds)
   end
 
-  local cycles = 0
-  local actual = 0
-  local lostG = 0
-  local wastedG = 0
-  local microTime = 0
-  local afkTime = 0
-  local noPressN = 0
-  local lateN = 0
-  local queuedN = 0
-  local qCovN = 0
-  local qMultiN = 0
+  local cycles, queued, late, queueCoverage = 0, 0, 0, 0
+  local afkTime, afkGapCount, afkPressCount = 0, 0, 0
 
-  local afkGapN = 0
-  local afkGapPressN = 0
-
-  -- Reuse arrays across calls (HUD calls this frequently during combat).
-  self._tmpGaps = self._tmpGaps or {}
-  self._tmpLateDelays = self._tmpLateDelays or {}
-  self._tmpAfterLates = self._tmpAfterLates or {}
-  self._tmpQDelays = self._tmpQDelays or {}
-  self._tmpPrevDurs = self._tmpPrevDurs or {}
-
-  local gaps = self._tmpGaps
-  local lateDelays = self._tmpLateDelays
-  local afterLates = self._tmpAfterLates
-  local qDelays = self._tmpQDelays
-  local prevDurs = self._tmpPrevDurs
-
+  self._contextGaps = self._contextGaps or {}
+  self._contextLate = self._contextLate or {}
+  self._contextQueueDelay = self._contextQueueDelay or {}
+  local gaps = self._contextGaps
+  local lateDelays = self._contextLate
+  local queueDelays = self._contextQueueDelay
   ClearArray(gaps)
   ClearArray(lateDelays)
-  ClearArray(afterLates)
-  ClearArray(qDelays)
-  ClearArray(prevDurs)
+  ClearArray(queueDelays)
 
-  for e in self.cycleLog:Iter() do
-    if e.t >= tStart and e.t <= tEnd then
+  for cycle in self.cycleLog:Iter() do
+    if cycle.t >= startTime and cycle.t <= endTime then
       cycles = cycles + 1
-      actual = actual + 1 -- each record corresponds to one confirmed GCD start after the first
-      lostG = lostG + (e.lost or 0)
-      if e.prevDur and e.prevDur > 0 then
-        wastedG = wastedG + ((e.micro or 0) / e.prevDur)
-      end
-      microTime = microTime + (e.micro or 0)
-      afkTime = afkTime + (e.afk or 0)
-      if e.afkGap then afkGapN = afkGapN + 1 end
-      if e.afkPress then afkGapPressN = afkGapPressN + 1 end
-      if e.noPress then noPressN = noPressN + 1 end
-      if e.late then lateN = lateN + 1 end
-      if e.class == "queued" then queuedN = queuedN + 1 end
-      if e.qCov then qCovN = qCovN + 1 end
-      if e.qMulti then qMultiN = qMultiN + 1 end
+      afkTime = afkTime + (cycle.afk or 0)
+      if cycle.queued then queued = queued + 1 end
+      if cycle.late then late = late + 1 end
+      if cycle.qCov then queueCoverage = queueCoverage + 1 end
+      if cycle.afkGap then afkGapCount = afkGapCount + 1 end
+      if cycle.afkPress then afkPressCount = afkPressCount + 1 end
 
-      gaps[#gaps + 1] = e.delay or 0
-      if e.late and e.lateDelay then lateDelays[#lateDelays + 1] = math.max(0, e.lateDelay) end
-      if e.late and e.afterLate then afterLates[#afterLates + 1] = math.max(0, e.afterLate) end
-      if e.qDelay then qDelays[#qDelays + 1] = math.max(0, e.qDelay) end
-      if e.prevDur and e.prevDur > 0 then prevDurs[#prevDurs + 1] = e.prevDur end
+      gaps[#gaps + 1] = cycle.delay or 0
+      if cycle.late then lateDelays[#lateDelays + 1] = cycle.lateDelay or 0 end
+      if cycle.qDelay then queueDelays[#queueDelays + 1] = cycle.qDelay end
     end
   end
-
-  local dur = math.max(0, tEnd - tStart)
-  if #prevDurs > 1 then table.sort(prevDurs) end
-  local gcdNow = MedianSorted(prevDurs) or (self.lastGCDDur or 0) or 0
-  if gcdNow <= 0 then gcdNow = 1.5 end
-
-  local possibleStarts = actual + lostG
-  local eff = (possibleStarts > 0) and (actual / possibleStarts) or 0
 
   if #gaps > 1 then table.sort(gaps) end
   if #lateDelays > 1 then table.sort(lateDelays) end
-  if #afterLates > 1 then table.sort(afterLates) end
-  if #qDelays > 1 then table.sort(qDelays) end
+  if #queueDelays > 1 then table.sort(queueDelays) end
 
-  local gapP90 = PercentileSorted(gaps, 0.90)
-  local lateP90Ms = PercentileSorted(lateDelays, 0.90) * 1000
-  local afterP90Ms = PercentileSorted(afterLates, 0.90) * 1000
-  local qDelayP90Ms = PercentileSorted(qDelays, 0.90) * 1000
-
-  local noPressPct = (cycles > 0) and (noPressN / cycles) or 0
-  local lateShare = (cycles > 0) and (lateN / cycles) or 0
-  local qHit = (cycles > 0) and (queuedN / cycles) or 0
-  local qCov = (cycles > 0) and (qCovN / cycles) or 0
-  local qMultiShare = (cycles > 0) and (qMultiN / cycles) or 0
-
-  local sysDelaySec = EstimateSystemDelaySec(self, NS:GetConfig())
-
-  local idleSec = self:GetSecondsSinceLastPress(now)
-
-  -- Reuse output table to reduce garbage; HUD consumes it immediately.
-  self._ctxOut = self._ctxOut or {}
-  local out = self._ctxOut
-
-  out.dur = dur
-  out.durSec = dur
-  out.elapsedSec = (self.segmentStart and (tEnd - self.segmentStart)) or 0
-  out.cycles = cycles
-  out.actualFight = actual
-  out.eff = eff
-  out.possibleStarts = possibleStarts
-  out.lostG = lostG
-  out.wastedG = wastedG
-  out.microTime = microTime
-  out.afkTime = afkTime
-  out.tailG = 0
-  out.gapP90Sec = gapP90
-  out.qHit = qHit
-  out.qCov = qCov
-  out.qMultiShare = qMultiShare
-  out.noPressPct = noPressPct
-  out.lateShare = lateShare
-  out.lateP90Ms = lateP90Ms
-  out.afterP90Ms = afterP90Ms
-  out.qDelayP90Ms = qDelayP90Ms
-  out.sysDelaySec = sysDelaySec
-  out.gcdNowSec = gcdNow
-  out.idleSec = idleSec
-  out.afkDen = afkGapN
-  out.afkPressPct = (afkGapN > 0) and (afkGapPressN / afkGapN) or 0
-
-  return out
+  local output = self._contextOutput or {}
+  self._contextOutput = output
+  output.gapP90Sec = PercentileSorted(gaps, 0.90)
+  output.qHit = cycles > 0 and (queued / cycles) or 0
+  output.qCov = cycles > 0 and (queueCoverage / cycles) or 0
+  output.lateShare = cycles > 0 and (late / cycles) or 0
+  output.lateP90Ms = PercentileSorted(lateDelays, 0.90) * 1000
+  output.qDelayP90Ms = PercentileSorted(queueDelays, 0.90) * 1000
+  output.afkTime = afkTime
+  output.afkDen = afkGapCount
+  output.afkPressPct = afkGapCount > 0 and (afkPressCount / afkGapCount) or 0
+  return output
 end
 
--- getters
-function M:GetSecondsSinceLastPress
-(now)
-  local t = self.lastPressAt or 0
-  if t <= 0 then return 1e9 end
-  return (now or GetTime()) - t
+function M:GetSecondsSinceLastPress(now)
+  if not self.lastPressAt then return nil end
+  return math.max(0, (now or Now()) - self.lastPressAt)
 end
 
 function M:GetFightDuration(now)
   if not self.segmentStart then return 0 end
-  if self.inSegment then return (now or GetTime()) - self.segmentStart end
-  if self.segmentEnd or self.segmentEndEffective then return (self.segmentEndEffective or self.segmentEnd) - self.segmentStart end
-  return 0
+  if self.inSegment then return (now or Now()) - self.segmentStart end
+  local finish = self.segmentEndEffective or self.segmentEnd
+  return finish and math.max(0, finish - self.segmentStart) or 0
 end
 
 function M:GetActualFight() return self.actualFight or 0 end
 
-function M:GetActualWindow(now, windowSeconds)
-  if not self.inSegment then return 0 end
-  local W = windowSeconds or 60
-  local cutoff = now - W
-  self.gcdStarts:PopFrontWhile(function(t) return t < cutoff end)
-  return self.gcdStarts:Size()
-end
-
--- GCD starts per minute over the last 10 seconds.
--- (Called "APM10" in the HUD for familiarity.)
-function M:GetAPM10(now)
-  now = now or GetTime()
-  local n = self:GetActualWindow(now, 10)
-  return n * 6
-end
-
--- Median measured GCD cycle time (seconds) from recent intervals.
-function M:GetMedianGCD()
-  local s = self:GetIntervalStats()
-  return (s and s.median) or 0
-end
-
-function M:GetWasteMicroTime() return self.wasteMicroTime or 0 end
-function M:GetAFKTime() return self.afkTime or 0 end
-function M:GetTailTime() return self.tailTime or 0 end
 function M:GetWastedGCD() return self.wastedGCD or 0 end
-function M:GetLostTime() return self.lostTime or 0 end
-function M:GetLostGcd() return self.lostGcd or 0 end
-function M:GetLastReadyTime() return self.lastReadyTime end
 
 function M:GetCurrentGap(atTime)
-  local t = self.lastReadyTime
-  if not t then return 0 end
-  local g = (atTime or GetTime()) - t
-  if g < 0 then g = 0 end
-  return g
+  if not self.lastReadyTime then return 0 end
+  return math.max(0, (atTime or Now()) - self.lastReadyTime)
 end
 
-function M:GetIntervalStats()
-  local arr = DequeToArray(self.intervals)
-  return { mean = U.Mean(arr), median = U.Median(arr), p90 = U.Percentile(arr, 0.90), n = #arr }
+local function StatsFromDeque(deque)
+  local values = DequeToArray(deque)
+  local count = #values
+  if count == 0 then return { mean = 0, median = 0, p90 = 0, n = 0 } end
+
+  local total = 0
+  for index = 1, count do total = total + values[index] end
+  if count > 1 then table.sort(values) end
+  return {
+    mean = total / count,
+    median = MedianSorted(values),
+    p90 = PercentileSorted(values, 0.90),
+    n = count,
+  }
 end
 
-function M:GetGapStatsFull()
-  local arr = DequeToArray(self.gapFull)
-  return { mean = U.Mean(arr), median = U.Median(arr), p90 = U.Percentile(arr, 0.90), n = #arr }
-end
-
-function M:GetQueueLeadStats()
-  local arr = DequeToArray(self.queueLead)
-  return { mean = U.Mean(arr), median = U.Median(arr), p90 = U.Percentile(arr, 0.90), n = #arr }
-end
-
-function M:GetStartDelayQueuedStats()
-  local arr = DequeToArray(self.startDelayQueued)
-  return { mean = U.Mean(arr), median = U.Median(arr), p90 = U.Percentile(arr, 0.90), n = #arr }
-end
-
-function M:GetLatePressStats()
-  local arr = DequeToArray(self.latePress)
-  return { mean = U.Mean(arr), median = U.Median(arr), p90 = U.Percentile(arr, 0.90), n = #arr }
-end
-
-function M:GetAfterPressLateStats()
-  local arr = DequeToArray(self.afterPressLate)
-  return { mean = U.Mean(arr), median = U.Median(arr), p90 = U.Percentile(arr, 0.90), n = #arr }
-end
+function M:GetGapStatsFull() return StatsFromDeque(self.gapFull) end
+function M:GetQueueLeadStats() return StatsFromDeque(self.queueLead) end
+function M:GetStartDelayQueuedStats() return StatsFromDeque(self.startDelayQueued) end
+function M:GetLatePressStats() return StatsFromDeque(self.latePress) end
 
 function M:GetPressClassCounts()
   return {
@@ -654,131 +461,116 @@ function M:GetPressClassCounts()
     queued = self.queuedN or 0,
     late = self.lateN or 0,
     none = self.noneN or 0,
+    unobserved = self.noneN or 0,
+    ambiguous = self.ambiguousN or 0,
+    attributable = self.attributableN or 0,
   }
 end
 
--- QC% across cycles
+function M:GetObservationCounts()
+  return {
+    total = self.actualFight or 0,
+    direct = self.directStarts or 0,
+    estimated = self.estimatedStarts or 0,
+    exactCycles = self.cycleN or 0,
+    ineligibleCycles = self.ineligibleCycles or 0,
+    attributable = self.attributableN or 0,
+    ambiguous = self.ambiguousN or 0,
+    unobserved = self.noneN or 0,
+  }
+end
+
 function M:GetQueueCoverageShare()
   local cycles = self.cycleN or 0
-  local n = self.queueCovN or 0
-  local share = (cycles > 0) and (n / cycles) or 0
-  return n, cycles, share
+  local count = self.queueCovN or 0
+  return count, cycles, cycles > 0 and (count / cycles) or 0
 end
 
 
-function M:GetQueueMultiShare()
+function M:GetAmbiguousShare()
   local cycles = self.cycleN or 0
-  local n = self.queueMultiN or 0
-  local share = (cycles > 0) and (n / cycles) or 0
-  return n, cycles, share
+  local count = self.ambiguousN or 0
+  return count, cycles, cycles > 0 and (count / cycles) or 0
 end
 
-function M:GetSystemDelaySec()
-  return self.sysDelaySec or 0
-end
-
-
--- AFKp% among AFK-gap cycles (gap > MicroCap)
 function M:GetAFKPressShare()
-  local denom = self.afkGapN or 0
-  local n = self.afkGapPressN or 0
-  local share = (denom > 0) and (n / denom) or 0
-  return n, denom, share
-end
-
--- SDq>0% among queued-classified
-function M:GetQueuedDelayNonZeroShare()
-  local q = self.queuedN or 0
-  local n = self.queuedDelayNonZeroN or 0
-  local share = (q > 0) and (n / q) or 0
-  return n, q, share
+  local denominator = self.afkGapN or 0
+  local count = self.afkGapPressN or 0
+  return count, denominator, denominator > 0 and (count / denominator) or 0
 end
 
 
--- Recommend SpellQueueWindow (ms) based on recent cycles, player latency, and press behavior.
--- Goal: high queue coverage (press in [ready-SQW, ready]) while minimizing multi-press inside the window.
--- Returns: recMs, diagTable
 function M:RecommendSpellQueueWindow()
-  local cfg = NS:GetConfig()
-  local cycles = DequeToArray(self.cycleData or U.Deque:New())
-  local n = #cycles
-  local diag = { sampleN = n }
-  if n < (cfg.recommendMinSamples or 20) then
-    diag.lowSample = true
-  end
+  local config = NS:GetConfig()
+  local cycles = DequeToArray(self.cycleData)
+  local count = #cycles
+  local diagnostic = {
+    sampleN = count,
+    eligibleN = count,
+    exactCycles = self.cycleN or 0,
+  }
 
-  -- latency (ms). GetNetStats returns home/world latency in ms.
+  local _, _, ambiguousShare = self:GetAmbiguousShare()
+  diagnostic.ambiguous = ambiguousShare
+  diagnostic.multi = ambiguousShare
+
   local _, _, home, world = GetNetStats()
-  local lat = tonumber(world) or tonumber(home) or 0
-  if home and world then lat = math.max(home, world) end
-  diag.latencyMs = lat
+  local latency = tonumber(world) or tonumber(home) or 0
+  if home and world then latency = math.max(home, world) end
+  diagnostic.latencyMs = latency
 
-  local function eval(wMs)
-    local w = wMs / 1000
-    local cov, multi, none = 0, 0, 0
-    for i = 1, n do
-      local c = cycles[i]
-      local r = c.ready
-      local presses = c.presses or {}
-      local k = 0
-      for j = 1, #presses do
-        local t = presses[j]
-        if t >= (r - w) and t <= r then
-          k = k + 1
-        end
+  local minimumSamples = config.recommendMinSamples or 20
+  if count < minimumSamples then
+    diagnostic.lowSample = true
+    diagnostic.coverage = 0
+    diagnostic.noQueue = 1
+    diagnostic.recommendedMs = SafeGetCVarNumber("SpellQueueWindow", 400)
+    return diagnostic.recommendedMs, diagnostic
+  end
+
+  local minimum = math.floor(math.max(50, latency * (config.recommendLatencyFactor or 0.9)))
+  local maximum = config.recommendMaxMs or 400
+  local step = config.recommendStepMs or 5
+  if minimum > maximum then minimum = maximum end
+
+  local bestWindow, bestScore, bestCoverage = nil, -math.huge, 0
+  for windowMs = minimum, maximum, step do
+    local window = windowMs / 1000
+    local covered = 0
+    for index = 1, count do
+      local cycle = cycles[index]
+      if cycle.press >= (cycle.ready - window) and cycle.press <= cycle.ready then
+        covered = covered + 1
       end
-      if k >= 1 then cov = cov + 1 else none = none + 1 end
-      if k >= 2 then multi = multi + 1 end
     end
-    local covS = (n > 0) and (cov / n) or 0
-    local multiS = (n > 0) and (multi / n) or 0
-    local noneS = (n > 0) and (none / n) or 0
-    -- penalty weights tuned for: avoid double-queue more than chasing absolute coverage.
-    local score = covS - 1.8 * multiS - 0.6 * noneS
-    return score, covS, multiS, noneS
-  end
-
-  -- Candidate search. Lower bound influenced by latency (need enough window to pre-queue despite ping).
-  local minMs = math.floor(math.max(50, (lat * (cfg.recommendLatencyFactor or 1.0))))
-  local maxMs = cfg.recommendMaxMs or 400
-  local step = cfg.recommendStepMs or 5
-
-  local bestMs, bestScore = nil, -1e9
-  local bestCov, bestMulti, bestNone = 0, 0, 0
-  for wMs = minMs, maxMs, step do
-    local score, covS, multiS, noneS = eval(wMs)
+    local coverage = count > 0 and (covered / count) or 0
+    local score = coverage - (windowMs / 10000)
     if score > bestScore then
+      bestWindow = windowMs
       bestScore = score
-      bestMs = wMs
-      bestCov, bestMulti, bestNone = covS, multiS, noneS
+      bestCoverage = coverage
     end
   end
 
-  -- Fallback if no cycles.
-  if not bestMs then bestMs = 400 end
+  if not bestWindow then bestWindow = math.min(400, maximum) end
 
-  diag.bestScore = bestScore
-  diag.coverage = bestCov
-  diag.multi = bestMulti
-  diag.noQueue = bestNone
-
-  -- Conservative snap: add small buffer derived from user's typical early lead (median queueLead).
-  local leads = DequeToArray(self.queueLead or U.Deque:New())
+  local leads = DequeToArray(self.queueLead)
   table.sort(leads)
-  local medLead = 0
-  if #leads >= 1 then
-    medLead = leads[math.floor((#leads + 1) / 2)] * 1000
+  local medianLeadMs = 0
+  if #leads > 0 then
+    medianLeadMs = leads[math.floor((#leads + 1) / 2)] * 1000
   end
-  diag.medianLeadMs = medLead
-  local extra = cfg.recommendLeadBufferMs
-  if extra == nil then extra = math.floor(math.max(20, math.min(80, medLead))) end
-  diag.extraMs = extra
+  local buffer = config.recommendLeadBufferMs
+  if buffer == nil then buffer = math.floor(math.max(20, math.min(80, medianLeadMs))) end
 
-  local rec = bestMs
-  -- Ensure recommended is not below latency+buffer. This pushes towards values like 160ms at 100ms ping.
-  rec = math.max(rec, math.floor(lat + extra))
-  rec = math.max(0, math.min(maxMs, rec))
-  diag.recommendedMs = rec
+  local recommendation = math.max(bestWindow, math.floor(latency + buffer))
+  recommendation = U.Clamp(recommendation, 0, maximum)
 
-  return rec, diag
+  diagnostic.bestScore = bestScore
+  diagnostic.coverage = bestCoverage
+  diagnostic.noQueue = 1 - bestCoverage
+  diagnostic.medianLeadMs = medianLeadMs
+  diagnostic.extraMs = buffer
+  diagnostic.recommendedMs = recommendation
+  return recommendation, diagnostic
 end

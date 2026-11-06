@@ -2,21 +2,20 @@
 
 | Path | Responsibility |
 | --- | --- |
-| `GCDOptimizer.toc` | Retail 12.1 metadata, libraries, runtime load order; excludes developer harnesses. |
-| `GCDOptimizer_Core.lua` | Composition root, DB migration, lifecycle, combat automation, HUD visibility, sole `/gcdopt` dispatcher. |
-| `GCDOptimizer_Util.lua` | Shared helpers, deque, statistics, and newer accessibility helpers used by supporting modules. |
-| `GCDOptimizer_GCDEstimator.lua` | Direct GCD duration, attack-speed calibration, EWMA correction, and last-stable fallback. |
-| `GCDOptimizer_GCDDetector.lua` | Direct `61304` polling plus event-derived candidate starts when direct timing is unavailable. |
-| `GCDOptimizer_PressTracker.lua` | Secure post-hooks; local press timestamps only. |
-| `GCDOptimizer_Integrator.lua` | Piecewise possible-GCD integration from the estimator. |
-| `GCDOptimizer_Metrics.lua` | Queue/late/idle/loss/SQW accounting; source-confidence separation remains open. |
-| `GCDOptimizer_Failures.lua` | Payload-free player cast-failure timestamps and generic summaries. |
-| `GCDOptimizer_Anchors.lua` | Bounded overlay glow diagnostics. |
-| `GCDOptimizer_HUD.lua` | Rendering and recommendations. |
-| `GCDOptimizer_Options.lua` | Language settings panel. |
+| `GCDOptimizer.toc` | Retail 12.1.5 metadata and production load order. |
+| `GCDOptimizer_Core.lua` | Composition root, validated config, lifecycle, visibility, sole `/gcdopt` owner. |
+| `GCDOptimizer_Util.lua` | Secret-aware GCD/attack-speed boundary, deque, statistics. |
+| `GCDOptimizer_GCDEstimator.lua` | Direct/swing calibration, equipment/spec invalidation, source-labeled predictions. |
+| `GCDOptimizer_GCDDetector.lua` | Direct starts, activity-gated event fallback, dedupe and estimate upgrade. |
+| `GCDOptimizer_PressTracker.lua` | Timestamp-only secure post-hooks. |
+| `GCDOptimizer_Integrator.lua` | Piecewise possible-GCD integration; cached data excluded. |
+| `GCDOptimizer_Metrics.lua` | Source-aware cadence, exact attribution, latency and SQW recommendation. |
+| `GCDOptimizer_Failures.lua` | Payload-free generic player failure timestamps. |
+| `GCDOptimizer_Anchors.lua` | Bounded overlay diagnostics. |
+| `GCDOptimizer_HUD.lua` | Source-aware mini/details UI and combat-safe SQW control. |
+| `GCDOptimizer_Options.lua` | Language settings. |
 | `GCDOptimizer_Minimap.lua` | LibDataBroker/LibDBIcon launcher. |
-| `GCDOptimizer_Locale.lua` | Localization tables and lookup helpers. |
-| `GCDOptimizer_Test.lua` | Developer-only diagnostics; not loaded in production. |
-| `GCD_RUNTIME_EVIDENCE.md` | Conflicting evidence, probe contract, and acceptance criteria. |
-| `README_MIDNIGHT.md` | Retail 12.1 implementation notes and known debt. |
-| `todo.md` | Release-gate checklist. |
+| `GCDOptimizer_Locale.lua` | Localization lookup/tables. |
+| `GCDOptimizer_Test.lua` | Optional in-client diagnostics; excluded from the TOC. |
+| `tests/test_runtime.lua` | Deterministic Lua source tests; excluded from production. |
+| `GCD_RUNTIME_EVIDENCE.md` | Named-build live-client evidence matrix. |

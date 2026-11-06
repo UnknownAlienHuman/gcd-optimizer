@@ -1,78 +1,80 @@
 # GCD runtime evidence contract
 
-## Question
+## Status
 
-Does `C_Spell.GetSpellCooldown(61304)` provide ordinary usable numerical GCD timing in every supported combat restriction state, or must GCD Optimizer retain an estimated fallback?
+- Source target: Retail `12.1.5`, Interface `120105`.
+- Deterministic source tests: **PASS**.
+- Named-build in-game matrix: **NOT-RUN**.
 
-## Current evidence
-
-### Project/runtime history
-
-The pre-update source states that numerical GCD cooldown values could become Secret in Midnight combat. It implements an out-of-combat `UnitAttackSpeed` baseline, a current/base swing ratio, cast-to-cast EWMA, and a last-stable fallback. The repository split does not preserve the exact original build, error text, or restriction context behind that redesign.
-
-### Blizzard/community history
-
-Blizzard-origin addon-engineering notes list `61304` among cooldowns flagged non-secret. WoWUIDev discussions in January, February, and May 2026 describe it as intentionally whitelisted and show direct reads in combat-oriented code.
-
-### Current generated contract
-
-In build `12.1.0.69497`:
-
-- `C_Spell.GetSpellCooldown` remains restriction-sensitive;
-- `SpellCooldownInfo.startTime`, `duration`, and `modRate` are not individually marked `NeverSecret`;
-- `isActive` and `isEnabled` are `NeverSecret`;
-- `isOnGCD` is `NeverSecret`, but documented as reliable only while responding to `SPELL_UPDATE_COOLDOWN`;
-- `UnitAttackSpeed` is also restriction-sensitive.
-
-## Interpretation
-
-The documented whitelist is strong evidence of Blizzard's intended policy. It is not sufficient evidence to delete a fallback that exists because of contrary project runtime behavior. Possible explanations include a historical pre-whitelist build, a hotfix/regression, a restriction-specific exception, tainted execution, or an incorrect earlier diagnosis. The current repository does not yet distinguish them.
+The unresolved question is whether numerical fields from `C_Spell.GetSpellCooldown(61304)` remain ordinary in every supported combat/restriction context. Project history says they did not; Blizzard-origin notes describe a whitelist. The hybrid source model remains until named-build evidence resolves the conflict.
 
 ## Probe
 
-Run in every target context. `pcall` below is diagnostics only.
+Run with taint/restriction context recorded. `pcall` is error containment only; every returned value is still gated before use.
 
 ```lua
 local ID = 61304
-local LEVEL = {
-    [Enum.SecrecyLevel.NeverSecret] = "NeverSecret",
-    [Enum.SecrecyLevel.AlwaysSecret] = "AlwaysSecret",
-    [Enum.SecrecyLevel.ContextuallySecret] = "ContextuallySecret",
-}
 
 local function accessible(value)
-    if canaccessvalue then return canaccessvalue(value) end
-    if issecretvalue then return not issecretvalue(value) end
-    return true
+  if canaccessvalue then return canaccessvalue(value) end
+  if issecretvalue then return not issecretvalue(value) end
+  return true
+end
+
+local function accessibleTable(value)
+  if not accessible(value) then return false end
+  if type(value) ~= "table" then return false end
+  if canaccesstable and not canaccesstable(value) then return false end
+  return true
+end
+
+local function show(value)
+  if not accessible(value) then return "INACCESSIBLE" end
+  return type(value) .. ":" .. tostring(value)
 end
 
 local function readField(info, key)
-    local ok, value = pcall(function() return info and info[key] end)
-    if not ok then return "READ_ERROR" end
-    if not accessible(value) then return "INACCESSIBLE" end
-    return type(value) .. ":" .. tostring(value)
+  if not accessibleTable(info) then return "TABLE_INACCESSIBLE" end
+  local ok, value = pcall(function() return info[key] end)
+  if not ok then return "READ_ERROR" end
+  return show(value)
 end
 
 local version, build, buildDate, interface = GetBuildInfo()
-local info = C_Spell.GetSpellCooldown(ID)
-local mh = UnitAttackSpeed and UnitAttackSpeed("player")
+local okCooldown, info = pcall(C_Spell.GetSpellCooldown, ID)
+local okSwing, mainHand = pcall(UnitAttackSpeed, "player")
 
 print("GCDPROBE", version, build, buildDate, interface)
-print("hasRestrictions", C_Secrets.HasSecretRestrictions())
-print("generalCooldownSecret", C_Secrets.ShouldCooldownsBeSecret())
-print("policy", LEVEL[C_Secrets.GetSpellCooldownSecrecy(ID)])
-print("secretNow", C_Secrets.ShouldSpellCooldownBeSecret(ID))
+print("cooldownCall", tostring(okCooldown))
 print("startTime", readField(info, "startTime"))
 print("duration", readField(info, "duration"))
 print("modRate", readField(info, "modRate"))
 print("isActive", readField(info, "isActive"))
 print("isOnGCD", readField(info, "isOnGCD"))
-print("attackSpeed", accessible(mh) and tostring(mh) or "INACCESSIBLE")
+print("attackSpeedCall", tostring(okSwing))
+print("attackSpeed", show(mainHand))
+
+if C_Secrets then
+  if C_Secrets.HasSecretRestrictions then
+    print("hasRestrictions", show(C_Secrets.HasSecretRestrictions()))
+  end
+  if C_Secrets.ShouldCooldownsBeSecret then
+    print("generalCooldownSecret", show(C_Secrets.ShouldCooldownsBeSecret()))
+  end
+  if C_Secrets.GetSpellCooldownSecrecy then
+    print("policy", show(C_Secrets.GetSpellCooldownSecrecy(ID)))
+  end
+  if C_Secrets.ShouldSpellCooldownBeSecret then
+    print("secretNow", show(C_Secrets.ShouldSpellCooldownBeSecret(ID)))
+  end
+end
 ```
 
 ## Context matrix
 
-| Context | Build | Policy | Secret now | start/duration accessible | attack speed accessible | Tainted execution | Result |
+For every row record exact version, build, Interface, date, spec, equipment, taint state, and whether `SPELL_SECRECY_CHANGED` fired.
+
+| Context | Build | start/duration/modRate | isActive | attack speed | Source observed | Errors/taint | Result |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Outside combat | | | | | | | |
 | Open-world combat | | | | | | | |
@@ -81,9 +83,25 @@ print("attackSpeed", accessible(mh) and tostring(mh) or "INACCESSIBLE")
 | Arena | | | | | | | |
 | Battleground | | | | | | | |
 
+## Behavioral matrix
+
+Test separately:
+
+- ordinary and one-second base-GCD profiles;
+- instant, cast-time, channelled, and empowered actions;
+- off-GCD actions mixed into each rotation;
+- haste changes, attack-speed-only effects, weapon swaps, and spec changes;
+- direct → estimated → direct transitions;
+- login, `/reload`, start/stop/reset, combat auto-start/stop;
+- SpellQueueWindow control in and out of combat;
+- repeated sessions with no Lua or taint errors.
+
+Compare exact/estimated source counts and accepted starts against a recorded manual timeline.
+
 ## Acceptance rules
 
-- Direct-only design is allowed only if the full supported matrix proves ordinary numeric access and repeated testing survives hotfix/build changes.
-- Attack-speed fallback is allowed only when its inputs are accessible and calibration error is measured for relevant specs/effects.
-- A source failure downgrades confidence; it must not silently fabricate exact data.
-- Exact latency/SQW claims require exact or independently validated timing evidence.
+- Direct timing is exact only when every consumed numeric field is accessible and valid.
+- Event fallback requires confirmed generic-GCD activity plus a valid swing calibration.
+- Cached duration never creates a start.
+- Estimated and ambiguous samples never enter exact latency/SQW evidence.
+- A source-test PASS is not a live-client PASS.

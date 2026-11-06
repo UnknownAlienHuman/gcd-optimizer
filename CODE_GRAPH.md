@@ -2,34 +2,25 @@
 
 ```mermaid
 flowchart TD
-  TOC["GCDOptimizer.toc"] --> Core["Core: bootstrap + lifecycle + commands"]
-  Core --> DB[("GCDOptimizerDB")]
+  TOC["GCDOptimizer.toc"] --> Core["Core: config + lifecycle + commands"]
   Core --> Detector["GCDDetector"]
   Core --> Estimator["GCDEstimator"]
   Core --> Metrics["Metrics"]
   Core --> Integrator["Integrator"]
   Core --> HUD["HUD"]
-  Core --> Press["PressTracker"]
-  Core --> Failures["Failures"]
-  Core --> Anchors["Anchors"]
 
-  Spell["GetSpellCooldown(61304)"] -->|accessible numbers| Detector
-  Spell -->|accessible duration| Estimator
+  Cooldown["C_Spell.GetSpellCooldown(61304)"] --> Boundary["Util: accessibility + validation + modRate"]
+  Swing["UnitAttackSpeed(player)"] --> Boundary
+  Boundary -->|DIRECT_EXACT| Detector
+  Boundary -->|direct/swing pair| Estimator
+  Success["UNIT_SPELLCAST_SUCCEEDED"] -->|wake timestamp only| Detector
+  Estimator -->|ESTIMATED_SWING / CACHED| Detector
 
-  Swing["UnitAttackSpeed(player)"] -->|accessible calibrated ratio| Estimator
-  Success["UNIT_SPELLCAST_SUCCEEDED"] -->|candidate timestamp| Detector
-  Estimator --> Detector
-
-  Action["secure action paths"] -->|timestamp only| Press
+  Actions["secure action paths"] -->|timestamp only| Press["PressTracker"]
   Press --> Metrics
-  Detector -->|exact or estimated cycle| Metrics
+  Detector -->|source-labeled starts| Metrics
   Estimator --> Integrator
   Metrics --> HUD
   Integrator --> HUD
-
-  CastFail["player failure events"] -->|payload discarded| Failures
-  Failures --> HUD
-  Overlay["overlay glow events"] --> Anchors
-
-  Evidence["GCD_RUNTIME_EVIDENCE.md"] -. "live validation contract" .-> Detector
+  Failures["payload-free failures"] --> HUD
 ```

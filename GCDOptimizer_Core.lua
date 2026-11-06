@@ -1,30 +1,34 @@
 -- GCDOptimizer_Core.lua
--- Retail 12.1 bootstrap, SavedVariables migration, segment lifecycle, combat
--- automation, and the single authoritative /gcdopt command dispatcher.
+-- Retail 12.1.5 bootstrap, validated SavedVariables, segment lifecycle,
+-- combat automation, and the single authoritative /gcdopt dispatcher.
 
 local ADDON_NAME, NS = ...
+local U = NS.Util
 
 NS.addonName = ADDON_NAME
-NS.VERSION = "0.5.0-midnight-12.1"
-NS.DB_SCHEMA = 1
+NS.VERSION = "0.6.0-midnight-12.1.5"
+NS.DB_SCHEMA = 2
 
 local function Now()
   return GetTime()
 end
 
 local function SafeCall(object, method, ...)
-  if object and type(object[method]) == "function" then
-    local ok = pcall(object[method], object, ...)
-    return ok
+  if not (object and type(object[method]) == "function") then return false end
+
+  local ok, result = pcall(object[method], object, ...)
+  if not ok then
+    local handler = type(geterrorhandler) == "function" and geterrorhandler() or nil
+    if type(handler) == "function" then handler(result) end
   end
-  return false
+  return ok, result
 end
 
-local function DeepCopyDefaults(destination, defaults)
+local function MergeDefaults(destination, defaults)
   if type(destination) ~= "table" then destination = {} end
   for key, value in pairs(defaults) do
     if type(value) == "table" then
-      destination[key] = DeepCopyDefaults(
+      destination[key] = MergeDefaults(
         type(destination[key]) == "table" and destination[key] or {},
         value
       )
@@ -35,10 +39,27 @@ local function DeepCopyDefaults(destination, defaults)
   return destination
 end
 
+local OBSOLETE_SCHEMA1_KEYS = {
+  "analysisUpdateInterval",
+  "recommendMultiBadThr",
+  "recommendSleepBadThr",
+  "afkpMinSamples",
+  "recommendDiffBadMs",
+}
+
+local function MigrateConfig(database)
+  local schema = tonumber(database.__schemaVersion) or 0
+  if schema < 2 then
+    for index = 1, #OBSOLETE_SCHEMA1_KEYS do
+      database[OBSOLETE_SCHEMA1_KEYS[index]] = nil
+    end
+  end
+  return database
+end
+
 local DEFAULTS = {
   showHUD = true,
   hudUpdateInterval = 0.25,
-  analysisUpdateInterval = 5.0,
   pollInterval = 0.05,
   statWindowN = 60,
 
@@ -47,11 +68,7 @@ local DEFAULTS = {
   recommendMaxMs = 400,
   recommendStepMs = 5,
   recommendLeadBufferMs = nil,
-  recommendMultiBadThr = 0.15,
-  recommendSleepBadThr = 0.15,
-  recommendDiffBadMs = 60,
 
-  afkpMinSamples = 5,
   sysDelayMinSamples = 6,
   sysDelayLatencyFactor = 0.50,
 
@@ -67,10 +84,7 @@ local DEFAULTS = {
   microCapMin = 0.10,
   microCapMax = 0.40,
 
-  minimap = {
-    hide = false,
-  },
-
+  minimap = { hide = false },
   localeOverride = "auto",
 
   anchors = {
@@ -81,19 +95,60 @@ local DEFAULTS = {
   },
 }
 
+local function ClampNumber(tableValue, key, minimum, maximum, fallback)
+  local value = tonumber(tableValue[key])
+  if not value then value = fallback end
+  tableValue[key] = U.Clamp(value, minimum, maximum)
+end
+
+local function SanitizeConfig(config)
+  config.showHUD = config.showHUD ~= false
+  config.autoStartCombat = config.autoStartCombat ~= false
+  config.autoStopCombat = config.autoStopCombat ~= false
+  config.dynamicMicroCap = config.dynamicMicroCap ~= false
+
+  ClampNumber(config, "hudUpdateInterval", 0.10, 1.00, 0.25)
+  ClampNumber(config, "pollInterval", 0.03, 0.25, 0.05)
+  ClampNumber(config, "statWindowN", 20, 300, 60)
+  ClampNumber(config, "recommendMinSamples", 5, 200, 20)
+  ClampNumber(config, "recommendLatencyFactor", 0.25, 2.00, 0.9)
+  ClampNumber(config, "recommendMaxMs", 50, 4000, 400)
+  ClampNumber(config, "recommendStepMs", 1, 50, 5)
+  if config.recommendLeadBufferMs ~= nil then
+    local buffer = tonumber(config.recommendLeadBufferMs)
+    config.recommendLeadBufferMs = buffer and U.Clamp(buffer, 0, 500) or nil
+  end
+  ClampNumber(config, "sysDelayMinSamples", 3, 100, 6)
+  ClampNumber(config, "sysDelayLatencyFactor", 0.10, 1.50, 0.50)
+  ClampNumber(config, "pressBufferSeconds", 2, 30, 8)
+  ClampNumber(config, "pressBufferMax", 100, 5000, 1200)
+  ClampNumber(config, "microCap", 0.05, 1.00, 0.20)
+  ClampNumber(config, "microCapMargin", 0, 0.50, 0.05)
+  ClampNumber(config, "microCapMin", 0.05, 1.00, 0.10)
+  ClampNumber(config, "microCapMax", config.microCapMin, 1.50, 0.40)
+
+  if type(config.minimap) ~= "table" then config.minimap = { hide = false } end
+  config.minimap.hide = config.minimap.hide and true or false
+  if type(config.localeOverride) ~= "string" then config.localeOverride = "auto" end
+  if type(config.anchors) ~= "table" then config.anchors = {} end
+  config.anchors = MergeDefaults(config.anchors, DEFAULTS.anchors)
+  return config
+end
+
 function NS:GetConfig()
-  local db = _G.GCDOptimizerDB
-  if type(db) ~= "table" then db = {} end
+  if type(NS.db) == "table" and _G.GCDOptimizerDB == NS.db then
+    return NS.db
+  end
 
-  -- Version upgrades preserve compatible settings. Schema migrations, rather
-  -- than the release string, own any future destructive transformation.
-  db = DeepCopyDefaults(db, DEFAULTS)
-  db.__schemaVersion = NS.DB_SCHEMA
-  db.__addonVersion = NS.VERSION
-
-  _G.GCDOptimizerDB = db
-  NS.db = db
-  return db
+  local database = _G.GCDOptimizerDB
+  if type(database) ~= "table" then database = {} end
+  database = MigrateConfig(database)
+  database = SanitizeConfig(MergeDefaults(database, DEFAULTS))
+  database.__schemaVersion = NS.DB_SCHEMA
+  database.__addonVersion = NS.VERSION
+  _G.GCDOptimizerDB = database
+  NS.db = database
+  return database
 end
 
 NS.state = NS.state or {
@@ -108,12 +163,11 @@ NS.state = NS.state or {
 
 function NS:SetHUDShown(shown)
   shown = shown and true or false
-  local cfg = NS:GetConfig()
-  cfg.showHUD = shown
+  local config = NS:GetConfig()
+  config.showHUD = shown
 
   local hud = NS.HUD
   if hud and hud.frame then hud.frame:SetShown(shown) end
-
   if shown then
     SafeCall(hud, "StartTicker")
     SafeCall(hud, "Update", true)
@@ -142,9 +196,7 @@ function NS:StartSegment(now)
   SafeCall(NS.Anchors, "OnSegmentStart", now)
   SafeCall(NS.Failures, "OnSegmentStart", now)
   SafeCall(NS.HUD, "OnSegmentStart", now)
-  if not NS:GetConfig().showHUD then
-    SafeCall(NS.HUD, "StopTicker")
-  end
+  if not NS:GetConfig().showHUD then SafeCall(NS.HUD, "StopTicker") end
   return true
 end
 
@@ -152,12 +204,12 @@ function NS:PauseSegment(now)
   now = now or Now()
   if not NS.state.inSegment then return false end
 
-  local wasAutoCombat = NS.state.autoCombat and true or false
+  local wasAutomatic = NS.state.autoCombat and true or false
   NS.state.inSegment = false
   NS.state.segmentEnd = now
   NS.state.segmentEndEffective = now
   NS.state.autoCombat = false
-  NS.state.manualPaused = not wasAutoCombat
+  NS.state.manualPaused = not wasAutomatic
 
   SafeCall(NS.GCDEstimator, "OnSegmentEnd", now)
   SafeCall(NS.Metrics, "OnSegmentEnd", now)
@@ -174,7 +226,6 @@ end
 
 function NS:ResetSegment(now)
   now = now or Now()
-
   NS.state.inSegment = false
   NS.state.segmentStart = now
   NS.state.segmentEnd = now
@@ -184,7 +235,7 @@ function NS:ResetSegment(now)
   NS.state.firstGCDSeen = false
 
   SafeCall(NS.PressTracker, "Reset")
-  SafeCall(NS.GCDEstimator, "Reset", now)
+  SafeCall(NS.GCDEstimator, "ResetSegment", now)
   SafeCall(NS.Metrics, "Reset", now)
   SafeCall(NS.Integrator, "Reset", now)
   SafeCall(NS.GCDDetector, "Reset", now)
@@ -196,11 +247,10 @@ end
 function NS:ResetAndContinue(now)
   now = now or Now()
   local wasRunning = NS.state.inSegment
-  local wasAutoCombat = NS.state.autoCombat
-
+  local wasAutomatic = NS.state.autoCombat
   NS:ResetSegment(now)
   if wasRunning then
-    NS.state.autoCombat = wasAutoCombat
+    NS.state.autoCombat = wasAutomatic
     NS:StartSegment(now)
   end
 end
@@ -211,23 +261,43 @@ function NS:OnPress(timestamp)
   SafeCall(NS.Metrics, "OnPress", timestamp)
 end
 
-function NS:OnGCDStart(startTime, duration)
+local function MaybeReanchorExact(startTime, source)
+  if source ~= U.GCD_SOURCE_DIRECT then return end
+  local segmentStart = NS.state.segmentStart or startTime
+  local lead = segmentStart - startTime
+  if NS.state.autoCombat and lead > 0 and lead <= 2.0 then
+    NS.state.segmentStart = startTime
+    SafeCall(NS.Metrics, "ReanchorStart", startTime)
+    SafeCall(NS.Integrator, "ReanchorStart", startTime)
+  end
+end
+
+function NS:OnGCDStart(startTime, duration, source)
   if not NS.state.inSegment then return end
+  source = source or U.GCD_SOURCE_CACHED
 
   if not NS.state.firstGCDSeen then
     NS.state.firstGCDSeen = true
-    local segmentStart = NS.state.segmentStart or startTime
-    local lead = segmentStart - startTime
-    if NS.state.autoCombat and lead > 0 and lead <= 2.0 then
-      NS.state.segmentStart = startTime
-      SafeCall(NS.Metrics, "ReanchorStart", startTime)
-      SafeCall(NS.Integrator, "ReanchorStart", startTime)
-    end
+    MaybeReanchorExact(startTime, source)
   end
 
-  SafeCall(NS.GCDEstimator, "OnGCDStart", startTime, duration)
-  SafeCall(NS.Metrics, "OnGCDStart", startTime, duration)
-  SafeCall(NS.HUD, "OnGCDStart")
+  SafeCall(NS.GCDEstimator, "OnGCDStart", startTime, duration, source)
+  SafeCall(NS.Metrics, "OnGCDStart", startTime, duration, source)
+  SafeCall(NS.HUD, "OnGCDStart", startTime, duration, source)
+end
+
+function NS:OnGCDRefresh(startTime, duration, source)
+  if not NS.state.inSegment then return end
+  SafeCall(NS.Metrics, "RefreshLastGCD", startTime, duration, source)
+  SafeCall(NS.HUD, "OnRateUpdate")
+end
+
+function NS:OnGCDUpgrade(oldStart, newStart, duration, source)
+  if not NS.state.inSegment then return end
+  MaybeReanchorExact(newStart, source)
+  SafeCall(NS.GCDEstimator, "OnGCDStart", newStart, duration, source)
+  SafeCall(NS.Metrics, "UpgradeLastGCD", oldStart, newStart, duration, source)
+  SafeCall(NS.HUD, "OnGCDStart", newStart, duration, source)
 end
 
 function NS:OnRateUpdate()
@@ -235,22 +305,20 @@ function NS:OnRateUpdate()
 end
 
 function NS:OnCombatStart()
-  local cfg = NS:GetConfig()
-  if not cfg.autoStartCombat then return end
+  local config = NS:GetConfig()
+  if not config.autoStartCombat then return end
 
-  if NS.state.inSegment then
-    if NS.state.autoCombat then return end
-    NS:ResetSegment(Now())
-  end
+  -- Explicit/manual tracking owns its segment; combat automation must not
+  -- discard it or silently change its stop policy.
+  if NS.state.inSegment then return end
 
   NS.state.autoCombat = true
   NS:StartSegment(Now())
 end
 
 function NS:OnCombatEnd()
-  local cfg = NS:GetConfig()
-  if not cfg.autoStopCombat then return end
-  if NS.state.inSegment and NS.state.autoCombat then
+  local config = NS:GetConfig()
+  if config.autoStopCombat and NS.state.inSegment and NS.state.autoCombat then
     NS:PauseSegment(Now())
   end
 end
@@ -259,8 +327,7 @@ function NS:Init()
   if NS._inited then return end
   NS._inited = true
 
-  local cfg = NS:GetConfig()
-
+  local config = NS:GetConfig()
   SafeCall(NS.GCDEstimator, "Init")
   SafeCall(NS.PressTracker, "Init")
   SafeCall(NS.GCDDetector, "Init")
@@ -268,20 +335,10 @@ function NS:Init()
   SafeCall(NS.Anchors, "Init")
 
   NS:ResetSegment(Now())
-
   SafeCall(NS.HUD, "Init")
-  if NS.HUD and NS.HUD.frame and type(NS.HUD.frame.HookScript) == "function" and not NS.HUD._coreVisibilityHooked then
-    NS.HUD._coreVisibilityHooked = true
-    NS.HUD.frame:HookScript("OnHide", function()
-      if not NS:GetConfig().showHUD then
-        SafeCall(NS.HUD, "StopTicker")
-        if NS.HUD.detailsFrame then NS.HUD.detailsFrame:Hide() end
-      end
-    end)
-  end
   SafeCall(NS.Options, "Init")
   SafeCall(NS.Minimap, "Init")
-  NS:SetHUDShown(cfg.showHUD)
+  NS:SetHUDShown(config.showHUD)
 end
 
 local eventFrame = CreateFrame("Frame")
@@ -315,18 +372,20 @@ local function PrintHelp()
 end
 
 local function PrintDebug()
-  if not (NS.GCDEstimator and NS.GCDEstimator.DebugSnapshot) then
-    Print("Estimator unavailable")
-    return
-  end
-
-  local snapshot = NS.GCDEstimator:DebugSnapshot()
+  local estimator = NS.GCDEstimator and NS.GCDEstimator:DebugSnapshot() or {}
+  local detector = NS.GCDDetector and NS.GCDDetector:DebugSnapshot() or {}
+  local observations = NS.Metrics and NS.Metrics:GetObservationCounts() or {}
   Print(string.format(
-    "version=%s gcd=%.3f source=%s samples=%d",
+    "version=%s gcd=%.3f source=%s direct=%d estimated=%d exactCycles=%d attributed=%d ambiguous=%d status=%s",
     NS.VERSION,
-    snapshot.lastPred or 0,
-    tostring(snapshot.source or "unknown"),
-    snapshot.sampleCount or 0
+    estimator.lastPred or 0,
+    tostring(estimator.source or U.GCD_SOURCE_CACHED),
+    observations.direct or 0,
+    observations.estimated or 0,
+    observations.exactCycles or 0,
+    observations.attributable or 0,
+    observations.ambiguous or 0,
+    tostring(detector.status or U.GCD_STATUS_UNAVAILABLE)
   ))
 end
 
@@ -337,28 +396,17 @@ local function PrintAnchors()
   end
 
   local events = NS.Anchors:GetRecentEvents()
-  local first = math.max(1, #events - 14)
   if #events == 0 then
     Print("No anchor events")
     return
   end
 
-  for i = first, #events do
-    local eventData = events[i]
-    local line = string.format(
-      "[%.3f] %s",
-      tonumber(eventData.t) or 0,
-      tostring(eventData.type or "?")
-    )
-    if eventData.overlaySpellID then
-      line = line .. " spell=" .. tostring(eventData.overlaySpellID)
-    end
-    if eventData.confidence then
-      line = line .. string.format(" confidence=%.2f", eventData.confidence)
-    end
-    if eventData.reason then
-      line = line .. " (" .. tostring(eventData.reason) .. ")"
-    end
+  for index = math.max(1, #events - 14), #events do
+    local data = events[index]
+    local line = string.format("[%.3f] %s", tonumber(data.t) or 0, tostring(data.type or "?"))
+    if data.overlaySpellID then line = line .. " spell=" .. tostring(data.overlaySpellID) end
+    if data.confidence then line = line .. string.format(" confidence=%.2f", data.confidence) end
+    if data.reason then line = line .. " (" .. tostring(data.reason) .. ")" end
     Print(line)
   end
 end
@@ -394,8 +442,6 @@ SlashCmdList.GCDOPT = function(rawMessage)
     PrintDebug()
   elseif command == "anchors" then
     PrintAnchors()
-  elseif command == "help" then
-    PrintHelp()
   else
     PrintHelp()
   end

@@ -8,37 +8,31 @@ NS.Minimap = NS.Minimap or {}
 local M = NS.Minimap
 
 local function EnsureDB()
-  local cfg = NS:GetConfig()
-  if type(cfg.minimap) ~= "table" then cfg.minimap = { hide = false } end
-  if cfg.minimap.hide == nil then cfg.minimap.hide = false end
-  return cfg.minimap
+  return NS:GetConfig().minimap
 end
 
 local function ToggleHUD()
-  local cfg = NS:GetConfig()
-  NS:SetHUDShown(not cfg.showHUD)
+  local config = NS:GetConfig()
+  NS:SetHUDShown(not config.showHUD)
 end
 
 local function ToggleSegment()
   local now = GetTime()
-  if NS.state and NS.state.inSegment then
-    NS.state.autoCombat = false
+  NS.state.autoCombat = false
+  if NS.state.inSegment then
     NS:PauseSegment(now)
   else
-    NS.state.autoCombat = false
     NS:StartSegment(now)
   end
-  if NS.HUD and NS.HUD.Update then NS.HUD:Update(true) end
 end
 
 local function ResetSegment()
   NS:ResetAndContinue(GetTime())
-  if NS.HUD and NS.HUD.Update then NS.HUD:Update(true) end
 end
 
 function M:SetIconShown(shown)
-  local db = EnsureDB()
-  db.hide = not shown
+  local database = EnsureDB()
+  database.hide = not shown
   if not self.icon then return end
   if shown then
     self.icon:Show("GCDOptimizer")
@@ -52,11 +46,11 @@ function M:Init()
   self._inited = true
 
   if not LibStub then return end
-  local ldb = LibStub:GetLibrary("LibDataBroker-1.1", true)
+  local dataBroker = LibStub:GetLibrary("LibDataBroker-1.1", true)
   local icon = LibStub:GetLibrary("LibDBIcon-1.0", true)
-  if not (ldb and icon) then return end
+  if not (dataBroker and icon) then return end
 
-  local object = ldb:NewDataObject("GCDOptimizer", {
+  local object = dataBroker:NewDataObject("GCDOptimizer", {
     type = "launcher",
     text = "GCD Optimizer",
     icon = "Interface\\Icons\\INV_Misc_PocketWatch_01",
