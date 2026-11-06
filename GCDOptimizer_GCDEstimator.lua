@@ -121,6 +121,9 @@ function E:ObserveDirect(duration, observedAt, startTime)
       self.calibrationGCD = duration
       self.calibrationAt = observedAt
       self.calibrationInvalidatedBy = nil
+    else
+      self:InvalidateCalibration("attack_speed_unavailable")
+      self.source = U.GCD_SOURCE_DIRECT
     end
   end
   return true

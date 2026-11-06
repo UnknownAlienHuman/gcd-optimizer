@@ -1,114 +1,111 @@
 -- GCDOptimizer_Integrator.lua
--- Piecewise integration of usable exact/estimated GCD durations. Cached or
--- default low-confidence values are display-only and never create possible-GCD
--- claims.
+-- Observation-driven capacity estimate. Rendering never advances measurement
+-- or queries game APIs. A bounded rate history supports delayed GCD timestamps;
+-- an action checkpoint preserves the final tail cut even after history eviction.
 
 local _, NS = ...
 local U = NS.Util
 
 NS.Integrator = NS.Integrator or {}
 local I = NS.Integrator
+local HISTORY_LIMIT = 256
 
-local function Now()
-  return GetTime()
-end
-
-local function Prediction()
-  if NS.GCDEstimator and NS.GCDEstimator.GetPrediction then
-    return NS.GCDEstimator:GetPrediction()
+local function Rate(duration, source)
+  if (source == U.GCD_SOURCE_DIRECT or source == U.GCD_SOURCE_ESTIMATED)
+    and U.IsFiniteNumber(duration) and duration > 0
+  then
+    return 1 / duration
   end
-  return 1.5, U.GCD_SOURCE_CACHED
-end
-
-local function IsIntegrable(source)
-  return source == U.GCD_SOURCE_DIRECT or source == U.GCD_SOURCE_ESTIMATED
+  return 0
 end
 
 function I:Reset()
   self.started = false
   self.segStart = 0
   self.lastT = 0
-  self.lastG = 0
+  self.lastG = 1.5
   self.lastSource = U.GCD_SOURCE_CACHED
+  self.rate = 0
   self.totalIntervals = 0
-  self.sampleMin = 0.30
-  self.nextSampleAt = 0
+  self.history = U.Deque:New()
+  self.actionAt = nil
+  self.actionIntervals = nil
+  self.finalIntervals = nil
 end
 
 function I:OnSegmentStart(startTime)
   self:Reset()
   self.started = true
-  self.segStart = startTime or Now()
+  self.segStart = startTime or GetTime()
   self.lastT = self.segStart
-  self.lastG, self.lastSource = Prediction()
-  self.nextSampleAt = self.segStart + self.sampleMin
+  self.history:PushBack({ t = self.segStart, total = 0, rate = 0 })
 end
 
 function I:ReanchorStart(startTime)
   if not U.IsFiniteNumber(startTime) or startTime <= 0 then return end
-  self.started = true
-  self.segStart = startTime
-  self.lastT = startTime
-  self.lastG, self.lastSource = Prediction()
-  self.totalIntervals = 0
-  self.nextSampleAt = startTime + self.sampleMin
+  local duration, source = self.lastG, self.lastSource
+  self:OnSegmentStart(startTime)
+  self:Observe(startTime, duration, source)
 end
 
-function I:OnSegmentEnd()
-end
-
-function I:SampleAt(timestamp)
-  if not self.started or timestamp <= self.lastT then return end
-
-  local elapsed = timestamp - self.lastT
-  if elapsed > 0 and self.lastG > 0 and IsIntegrable(self.lastSource) then
-    self.totalIntervals = self.totalIntervals + (elapsed / self.lastG)
+function I:ValueAt(timestamp)
+  if timestamp <= self.segStart then return 0 end
+  local history = self.history
+  for index = history.tail, history.head, -1 do
+    local span = history.data[index]
+    if timestamp >= span.t then
+      return span.total + (timestamp - span.t) * span.rate
+    end
   end
-
-  self.lastT = timestamp
-  self.lastG, self.lastSource = Prediction()
+  -- Outside the bounded correction history: do not extrapolate an old rate.
+  return nil
 end
 
-function I:MaybeSample(now)
-  if not (NS.state and NS.state.inSegment) then return end
-  now = now or Now()
-  if not self.started then self:OnSegmentStart(NS.state.segmentStart or now) end
-  if now < (self.nextSampleAt or 0) then return end
+function I:Observe(timestamp, duration, source)
+  if not self.started or not U.IsFiniteNumber(timestamp) or timestamp < self.lastT then return end
 
-  self:SampleAt(now)
-  self.nextSampleAt = now + self.sampleMin
+  self.totalIntervals = self.totalIntervals + (timestamp - self.lastT) * self.rate
+  self.lastT = timestamp
+  local rate = Rate(duration, source)
+  if rate ~= self.rate then
+    local tail = self.history:Back()
+    if tail and tail.t == timestamp then
+      tail.rate = rate
+    else
+      self.history:PushBack({ t = timestamp, total = self.totalIntervals, rate = rate })
+      while self.history:Size() > HISTORY_LIMIT do self.history:PopFront() end
+    end
+    self.rate = rate
+  end
+  if U.IsFiniteNumber(duration) and duration > 0 then self.lastG = duration end
+  self.lastSource = source or U.GCD_SOURCE_CACHED
+end
+
+function I:CheckpointAction(timestamp)
+  if not self.started or not U.IsFiniteNumber(timestamp) or timestamp <= 0 then return end
+  if timestamp == self.actionAt then return end
+  local total = self:ValueAt(timestamp)
+  if total == nil then return end
+  self.actionAt = timestamp
+  self.actionIntervals = total
+end
+
+function I:OnSegmentEnd(endTime)
+  if not self.started then return end
+  local finish = NS.state and NS.state.segmentEndEffective or endTime or GetTime()
+  local total
+  if finish == self.actionAt then total = self.actionIntervals end
+  if total == nil then total = self:ValueAt(finish) end
+  self.finalIntervals = math.max(0, total or self.actionIntervals or 0)
+  self.started = false
 end
 
 function I:GetCurrentPrediction()
-  local now = Now()
-  self:MaybeSample(now)
-  local duration, source = Prediction()
-  return duration, source
-end
-
-local function EndTime(now)
-  if NS.state and NS.state.inSegment then return now or Now() end
-  if NS.state and NS.state.segmentEndEffective and NS.state.segmentEndEffective > 0 then
-    return NS.state.segmentEndEffective
-  end
-  if NS.state and NS.state.segmentEnd and NS.state.segmentEnd > 0 then
-    return NS.state.segmentEnd
-  end
-  return now or Now()
+  return self.lastG or 1.5, self.lastSource or U.GCD_SOURCE_CACHED
 end
 
 function I:GetPossibleFight(now)
-  if not (NS.state and NS.state.segmentStart and NS.state.segmentStart > 0) then return 0 end
-
-  local finish = EndTime(now)
-  if finish <= NS.state.segmentStart then return 0 end
-  if NS.state.inSegment then self:MaybeSample(finish) end
-  if not self.started then self:OnSegmentStart(NS.state.segmentStart) end
-
-  local total = self.totalIntervals or 0
-  if self.lastT and finish > self.lastT and self.lastG > 0 and IsIntegrable(self.lastSource) then
-    total = total + ((finish - self.lastT) / self.lastG)
-  end
-  return math.max(0, total)
+  if self.finalIntervals ~= nil then return self.finalIntervals end
+  if not self.started then return 0 end
+  return math.max(0, self:ValueAt(now or GetTime()) or 0)
 end
-

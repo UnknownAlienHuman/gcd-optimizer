@@ -66,6 +66,7 @@ function D:CancelPendingFallback()
 end
 
 function D:StopTicker()
+  self.pollGeneration = (self.pollGeneration or 0) + 1
   if self.ticker then
     self.ticker:Cancel()
     self.ticker = nil
@@ -82,6 +83,7 @@ function D:Reset()
   self.liveDuration = nil
   self.liveSource = U.GCD_SOURCE_CACHED
   self.lastStatus = U.GCD_STATUS_UNAVAILABLE
+  self.inBlindInterval = false
   self.sawInactiveSinceLastStart = true
   self.requireInactiveBeforeEstimate = false
   self.exactCount = 0
@@ -93,7 +95,9 @@ function D:OnSegmentStart()
   self:Reset()
   local cfg = NS:GetConfig()
   local interval = U.Clamp(cfg.pollInterval or 0.05, 0.03, 0.25)
+  local generation = self.pollGeneration
   self.ticker = C_Timer.NewTicker(interval, function()
+    if generation ~= self.pollGeneration then return end
     if NS.state and NS.state.inSegment then self:Observe("ticker") end
   end)
 
@@ -121,6 +125,8 @@ function D:IsBeforeManualSegment(startTime)
 end
 
 function D:AcceptStart(startTime, duration, source)
+  if not (NS.state and NS.state.inSegment) then return false end
+  if source ~= U.GCD_SOURCE_DIRECT and source ~= U.GCD_SOURCE_ESTIMATED then return false end
   if not (ValidStart(startTime) and ValidDuration(duration)) then return false end
   if self:IsBeforeManualSegment(startTime) then return false end
 
@@ -199,38 +205,55 @@ function D:HandleDirect(startTime, duration)
   if NS.GCDEstimator then
     NS.GCDEstimator:ObserveDirect(duration, Now(), startTime)
   end
+  if NS.OnGCDObservation then
+    NS:OnGCDObservation(Now(), duration, U.GCD_SOURCE_DIRECT)
+  end
   return self:AcceptStart(startTime, duration, U.GCD_SOURCE_DIRECT)
 end
 
 function D:Observe(reason)
   local status, startTime, duration = U.ReadGCDObservation()
+  if status == U.GCD_STATUS_EXACT
+    and not (ValidStart(startTime) and ValidDuration(duration))
+  then
+    status = U.GCD_STATUS_MALFORMED
+  end
   self.lastStatus = status
   self.lastReason = reason
 
+  local blind = status ~= U.GCD_STATUS_EXACT and status ~= U.GCD_STATUS_INACTIVE
+  if reason == "SPELL_SECRECY_CHANGED" then self:CancelPendingFallback() end
+  if (blind and not self.inBlindInterval) or reason == "SPELL_SECRECY_CHANGED" then
+    if NS.OnGCDObservationGap then NS:OnGCDObservationGap() end
+  end
+  self.inBlindInterval = blind
+
   if status == U.GCD_STATUS_EXACT then
+    if self.pendingFallback then self:CancelPendingFallback() end
     self:HandleDirect(startTime, duration)
-  elseif status == U.GCD_STATUS_INACTIVE then
-    self.liveStart = nil
-    self.liveDuration = nil
-    self.sawInactiveSinceLastStart = true
-    self.requireInactiveBeforeEstimate = false
-  elseif status == U.GCD_STATUS_ACTIVE_RESTRICTED then
-    local predicted, source = NS.GCDEstimator:GetFallbackPrediction()
-    self.liveStart = nil
-    self.liveDuration = predicted
-    self.liveSource = source
   else
-    -- A blind/malformed read invalidates the previous live observation. The HUD
-    -- may still show the estimator's separately labeled fallback prediction.
+    local predicted, source
+    if status == U.GCD_STATUS_INACTIVE or status == U.GCD_STATUS_ACTIVE_RESTRICTED then
+      predicted, source = NS.GCDEstimator:GetFallbackPrediction()
+    else
+      -- No usable observation: never integrate a stale exact rate over the gap.
+      source = U.GCD_SOURCE_CACHED
+    end
     self.liveStart = nil
-    self.liveDuration = nil
-    self.liveSource = U.GCD_SOURCE_CACHED
+    self.liveDuration = status == U.GCD_STATUS_ACTIVE_RESTRICTED and predicted or nil
+    self.liveSource = source
+    if status == U.GCD_STATUS_INACTIVE then
+      self.sawInactiveSinceLastStart = true
+      self.requireInactiveBeforeEstimate = false
+    end
+    if NS.OnGCDObservation then NS:OnGCDObservation(Now(), predicted, source) end
   end
 
   return status
 end
 
 function D:ScheduleEstimatedFallback(eventTime)
+  if not (NS.state and NS.state.inSegment) then return end
   if not ValidStart(eventTime) then return end
 
   -- Even an initially inactive result is deferred once: event ordering can
@@ -241,17 +264,12 @@ function D:ScheduleEstimatedFallback(eventTime)
   self:CancelPendingFallback()
   local generation = self.pendingGeneration
   self.pendingFallback = C_Timer.NewTimer(FALLBACK_DELAY, function()
-    self.pendingFallback = nil
     if generation ~= self.pendingGeneration then return end
+    self.pendingFallback = nil
     if not (NS.state and NS.state.inSegment) then return end
 
-    local currentStatus, startTime, duration = U.ReadGCDObservation()
-    self.lastStatus = currentStatus
-
-    if currentStatus == U.GCD_STATUS_EXACT then
-      self:HandleDirect(startTime, duration)
-      return
-    end
+    -- Use the same boundary/integration path as the event and ticker owners.
+    local currentStatus = self:Observe("fallback")
     if currentStatus ~= U.GCD_STATUS_ACTIVE_RESTRICTED then return end
     if self.requireInactiveBeforeEstimate then return end
 

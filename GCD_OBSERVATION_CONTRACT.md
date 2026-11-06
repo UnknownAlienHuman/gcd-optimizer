@@ -58,6 +58,16 @@ For each exact-to-exact cycle, consider local presses in the attribution window:
 
 Unobserved and ambiguous cycles remain useful for aggregate cadence/press-density diagnostics, but are excluded from exact latency and SQW recommendations.
 
+## Observation continuity
+
+Restricted, unavailable, malformed, and `SPELL_SECRECY_CHANGED` observations break exact adjacency without stopping the segment or erasing accepted counts. Discard pending fallback inference on policy invalidation and input/SQW evidence spanning the boundary. Preserve detector identity for deduplication.
+
+A recovered same-start observation does not reopen the old exact link. A new accepted start establishes the next baseline. An estimate-to-direct upgrade may improve that start's source, but must not retroactively analyze a cycle crossing a blind interval. Ordinary inactive observations do not break continuity.
+
+## Capacity accounting
+
+Detector observations, not UI reads, own the integration rate. Cached/unavailable observations have zero rate; usable swing-derived rates remain estimates. Keep rate-change history bounded and checkpoint the latest meaningful action for the final idle-tail cut. After segment end, the integral is immutable. Showing, hiding, or refreshing the HUD must not change it.
+
 ## Upgrade rule
 
 If direct timing arrives within the upgrade window of an accepted estimate, replace the estimate's source/timing in place. Do not add a second cycle. Within one deduplicated cycle, source quality is monotonic: estimated timing cannot overwrite an exact duration. An unchanged exact poll is not a refresh event.

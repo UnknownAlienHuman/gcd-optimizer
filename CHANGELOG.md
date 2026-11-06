@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — 2026-11-06
+
+- Break exact cycle/input continuity on restricted, unavailable, malformed, or secrecy-policy boundaries; preserve observed start counts and deduplication. Recovery and estimate upgrades cannot backfill a blind interval.
+- Drive possible-GCD integration from detector observations, not HUD reads. Rendering is read-only; unavailable intervals contribute no capacity. A bounded rate history and last-action checkpoint freeze the final idle-tail cut independently of HUD visibility.
+- Reject stale detector/fallback callbacks before they query APIs or touch replacement timer handles; standalone reset also cancels HUD work.
+- Invalidate the old swing calibration when a new exact GCD has no readable swing sample, retaining only the last stable display duration.
+- Repair non-finite numeric settings before timers, bounded buffers, or SQW search use them.
+- Add `tests/test_continuity.lua` for these regressions. All three suites pass under standalone Lua 5.3 and 5.4; the in-game/taint/performance matrix remains NOT-RUN.
+
 ## 0.6.0-midnight-12.1.5 — 2026-11-06
 
 ### Observation model

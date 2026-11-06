@@ -97,7 +97,7 @@ local DEFAULTS = {
 
 local function ClampNumber(tableValue, key, minimum, maximum, fallback)
   local value = tonumber(tableValue[key])
-  if not value then value = fallback end
+  if not U.IsFiniteNumber(value) then value = fallback end
   tableValue[key] = U.Clamp(value, minimum, maximum)
 end
 
@@ -116,7 +116,7 @@ local function SanitizeConfig(config)
   ClampNumber(config, "recommendStepMs", 1, 50, 5)
   if config.recommendLeadBufferMs ~= nil then
     local buffer = tonumber(config.recommendLeadBufferMs)
-    config.recommendLeadBufferMs = buffer and U.Clamp(buffer, 0, 500) or nil
+    config.recommendLeadBufferMs = U.IsFiniteNumber(buffer) and U.Clamp(buffer, 0, 500) or nil
   end
   ClampNumber(config, "sysDelayMinSamples", 3, 100, 6)
   ClampNumber(config, "sysDelayLatencyFactor", 0.10, 1.50, 0.50)
@@ -132,6 +132,9 @@ local function SanitizeConfig(config)
   if type(config.localeOverride) ~= "string" then config.localeOverride = "auto" end
   if type(config.anchors) ~= "table" then config.anchors = {} end
   config.anchors = MergeDefaults(config.anchors, DEFAULTS.anchors)
+  ClampNumber(config.anchors, "maxEvents", 50, 2000, 300)
+  config.anchors.maxEvents = math.floor(config.anchors.maxEvents)
+  ClampNumber(config.anchors, "fadeWindow", 0.05, 1.00, 0.25)
   return config
 end
 
@@ -241,6 +244,7 @@ function NS:ResetSegment(now)
   SafeCall(NS.GCDDetector, "Reset", now)
   SafeCall(NS.Anchors, "Reset", now)
   SafeCall(NS.Failures, "Reset", now)
+  SafeCall(NS.HUD, "StopTicker")
   SafeCall(NS.HUD, "Update", true)
 end
 
@@ -255,10 +259,27 @@ function NS:ResetAndContinue(now)
   end
 end
 
+local function CheckpointAction()
+  if NS.Metrics then
+    SafeCall(NS.Integrator, "CheckpointAction", NS.Metrics:GetLastActionTime())
+  end
+end
+
+function NS:OnGCDObservation(timestamp, duration, source)
+  if not NS.state.inSegment then return end
+  SafeCall(NS.Integrator, "Observe", timestamp, duration, source)
+end
+
+function NS:OnGCDObservationGap()
+  if not NS.state.inSegment then return end
+  SafeCall(NS.Metrics, "BreakContinuity")
+end
+
 function NS:OnPress(timestamp)
   if not NS.state.inSegment then return end
   if type(timestamp) ~= "number" then timestamp = Now() end
   SafeCall(NS.Metrics, "OnPress", timestamp)
+  CheckpointAction()
 end
 
 local function MaybeReanchorExact(startTime, source)
@@ -283,6 +304,7 @@ function NS:OnGCDStart(startTime, duration, source)
 
   SafeCall(NS.GCDEstimator, "OnGCDStart", startTime, duration, source)
   SafeCall(NS.Metrics, "OnGCDStart", startTime, duration, source)
+  CheckpointAction()
   SafeCall(NS.HUD, "OnGCDStart", startTime, duration, source)
 end
 
@@ -297,6 +319,7 @@ function NS:OnGCDUpgrade(oldStart, newStart, duration, source)
   MaybeReanchorExact(newStart, source)
   SafeCall(NS.GCDEstimator, "OnGCDStart", newStart, duration, source)
   SafeCall(NS.Metrics, "UpgradeLastGCD", oldStart, newStart, duration, source)
+  CheckpointAction()
   SafeCall(NS.HUD, "OnGCDStart", newStart, duration, source)
 end
 

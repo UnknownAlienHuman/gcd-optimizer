@@ -121,6 +121,8 @@ function M:Reset()
   self.directStarts = 0
   self.estimatedStarts = 0
   self.ineligibleCycles = 0
+  self.continuityBroken = false
+  self.upgradePreviousEligible = false
 
   self.lastGCDStart = nil
   self.lastGCDDur = nil
@@ -159,14 +161,26 @@ function M:OnSegmentStart(startTime)
   self.segmentStart = startTime
 end
 
+function M:GetLastActionTime()
+  return math.max(self.lastGCDStart or 0, self.lastPressAt or 0)
+end
+
+function M:BreakContinuity()
+  if not self.inSegment or self.continuityBroken then return end
+  self.continuityBroken = true
+  self.upgradePreviousEligible = false
+  self.pressQueue = U.Deque:New()
+  -- Keep segment totals, but a recommendation must be supported by fresh
+  -- attributable cycles after the observation boundary.
+  self.cycleData = U.Deque:New()
+end
+
 function M:OnSegmentEnd(endTime)
   self.inSegment = false
   self.segmentEnd = endTime
 
   local effectiveEnd = endTime
-  local lastAction = 0
-  if self.lastGCDStart and self.lastGCDStart > lastAction then lastAction = self.lastGCDStart end
-  if self.lastPressAt and self.lastPressAt > lastAction then lastAction = self.lastPressAt end
+  local lastAction = self:GetLastActionTime()
   if lastAction > 0 and effectiveEnd > lastAction then effectiveEnd = lastAction end
   if self.segmentStart and effectiveEnd < self.segmentStart then effectiveEnd = self.segmentStart end
   self.segmentEndEffective = effectiveEnd
@@ -306,9 +320,15 @@ function M:OnGCDStart(startTime, duration, source)
   self.upgradePreviousStart = previousStart
   self.upgradePreviousDuration = previousDuration
   self.upgradePreviousSource = previousSource
+  self.upgradePreviousEligible = not self.continuityBroken
 
+  if self.continuityBroken then
+    self.pressQueue = U.Deque:New()
+  end
   if previousStart then
-    if previousSource == U.GCD_SOURCE_DIRECT and source == U.GCD_SOURCE_DIRECT then
+    if not self.continuityBroken
+      and previousSource == U.GCD_SOURCE_DIRECT and source == U.GCD_SOURCE_DIRECT
+    then
       self:AnalyzeExactCycle(previousStart, previousDuration, startTime)
     else
       self.ineligibleCycles = self.ineligibleCycles + 1
@@ -319,6 +339,7 @@ function M:OnGCDStart(startTime, duration, source)
   self.lastGCDDur = duration
   self.lastGCDSource = source
   self.lastReadyTime = startTime + duration
+  self.continuityBroken = false
 end
 
 function M:RefreshLastGCD(startTime, duration, source)
@@ -346,7 +367,9 @@ function M:UpgradeLastGCD(oldStart, newStart, duration, source)
   self.lastGCDSource = source
   self.lastReadyTime = newStart + duration
 
-  if self.upgradePreviousStart and self.upgradePreviousSource == U.GCD_SOURCE_DIRECT then
+  if self.upgradePreviousEligible and not self.continuityBroken
+    and self.upgradePreviousStart and self.upgradePreviousSource == U.GCD_SOURCE_DIRECT
+  then
     self.ineligibleCycles = math.max(0, self.ineligibleCycles - 1)
     self:AnalyzeExactCycle(
       self.upgradePreviousStart,
@@ -430,7 +453,7 @@ function M:GetActualFight() return self.actualFight or 0 end
 function M:GetWastedGCD() return self.wastedGCD or 0 end
 
 function M:GetCurrentGap(atTime)
-  if not self.lastReadyTime then return 0 end
+  if self.continuityBroken or not self.lastReadyTime then return 0 end
   return math.max(0, (atTime or Now()) - self.lastReadyTime)
 end
 
