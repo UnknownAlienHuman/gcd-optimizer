@@ -2,6 +2,18 @@
 
 ## Unreleased — 2026-11-06
 
+### Analytics and HUD follow-up
+
+- Age SQW evidence by all recent accepted starts, including ambiguous/unobserved input. Use the same fresh sample set for search and lead buffer; late-only input no longer produces a queue-window recommendation.
+- Include the configured maximum in the SQW search and report coverage for the returned value. Check the sorted-lead scan against an independent exhaustive reference over 120 deterministic datasets.
+- Use a coherent ten-second live verdict window with its own attributable sample count, excluding pre-boundary cycles. Preserve full-segment counters beyond the bounded rolling log; percentile samples stay bounded and are not whole-fight quantiles.
+- Remove the surviving old-hook inactivity verdict and ambiguity-as-player-error inference. Keep final verdicts independent of later combat/time changes; use public combat-lockdown state rather than unit combat data for presentation mode.
+- Close transient windows and cancel HUD work on actual hide; reject stale ticker callbacks and stale menu Start actions. Remove unused distribution getters after consolidating context collection.
+- Accumulate sub-millisecond duration corrections against the last forwarded value and invalidate a mismatched swing calibration without losing the latest direct display value.
+- Add `tests/test_review.lua`: 23 cases / 280 assertions, passing alongside all three existing suites under Lua 5.3 and 5.4. Live client, taint, rendering and performance remain NOT-RUN.
+
+### Continuity repair
+
 - Break exact cycle/input continuity on restricted, unavailable, malformed, or secrecy-policy boundaries; preserve observed start counts and deduplication. Recovery and estimate upgrades cannot backfill a blind interval.
 - Drive possible-GCD integration from detector observations, not HUD reads. Rendering is read-only; unavailable intervals contribute no capacity. A bounded rate history and last-action checkpoint freeze the final idle-tail cut independently of HUD visibility.
 - Reject stale detector/fallback callbacks before they query APIs or touch replacement timer handles; standalone reset also cancels HUD work.

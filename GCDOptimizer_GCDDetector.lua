@@ -165,7 +165,9 @@ function D:AcceptStart(startTime, duration, source)
       if currentRank >= previousRank then
         local durationChanged = not previousDuration
           or math.abs(duration - previousDuration) > DURATION_REFRESH_EPSILON
-        self.lastCountedDuration = duration
+        -- Compare with the last forwarded duration, not every poll. Tiny
+        -- corrections must accumulate rather than silently moving the baseline.
+        if durationChanged then self.lastCountedDuration = duration end
         if durationChanged
           and source == U.GCD_SOURCE_DIRECT
           and previousSource == U.GCD_SOURCE_DIRECT

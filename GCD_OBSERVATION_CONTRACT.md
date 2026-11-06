@@ -58,6 +58,14 @@ For each exact-to-exact cycle, consider local presses in the attribution window:
 
 Unobserved and ambiguous cycles remain useful for aggregate cadence/press-density diagnostics, but are excluded from exact latency and SQW recommendations.
 
+## Analysis windows
+
+SQW evidence is bounded by the latest `statWindowN` accepted starts, not the latest successful attributions alone. Ambiguous, unobserved and estimated starts age earlier samples. The lead buffer and candidate search use this same fresh sample set; late-only samples do not establish a usable queue window. Search includes its upper bound even when the step does not divide the range.
+
+Live verdicts use a ten-second window and at least five attributable cycles in that window after the latest continuity boundary. Missing/old hook evidence is not inactivity, and ambiguity is not a player-error verdict. Final verdicts use the closed segment, not later combat or elapsed wall time.
+
+Full-segment counts and gap-time totals are cumulative. Rolling records remain bounded to 600 cycles; final-report percentile distributions use the latest `statWindowN` samples in each category, not whole-fight quantiles. Queue-hit and late-input shares divide by attributable cycles; queue coverage divides by all exact cycles.
+
 ## Observation continuity
 
 Restricted, unavailable, malformed, and `SPELL_SECRECY_CHANGED` observations break exact adjacency without stopping the segment or erasing accepted counts. Discard pending fallback inference on policy invalidation and input/SQW evidence spanning the boundary. Preserve detector identity for deduplication.
@@ -70,7 +78,7 @@ Detector observations, not UI reads, own the integration rate. Cached/unavailabl
 
 ## Upgrade rule
 
-If direct timing arrives within the upgrade window of an accepted estimate, replace the estimate's source/timing in place. Do not add a second cycle. Within one deduplicated cycle, source quality is monotonic: estimated timing cannot overwrite an exact duration. An unchanged exact poll is not a refresh event.
+If direct timing arrives within the upgrade window of an accepted estimate, replace the estimate's source/timing in place. Do not add a second cycle. Within one deduplicated cycle, source quality is monotonic: estimated timing cannot overwrite an exact duration. An unchanged exact poll is not a refresh event. Compare duration corrections against the last forwarded value so sub-threshold steps accumulate. A material same-start duration correction invalidates its original swing pair; only a fresh exact start can recalibrate it.
 
 ## Runtime status
 

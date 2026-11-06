@@ -122,6 +122,7 @@ function M:Reset()
   self.estimatedStarts = 0
   self.ineligibleCycles = 0
   self.continuityBroken = false
+  self.continuityObservation = 0
   self.upgradePreviousEligible = false
 
   self.lastGCDStart = nil
@@ -135,6 +136,7 @@ function M:Reset()
   self.upgradePreviousSource = nil
 
   self.wastedGCD = 0
+  self.afkTime = 0
 
   self.gapFull = U.Deque:New()
   self.queueLead = U.Deque:New()
@@ -168,6 +170,7 @@ end
 function M:BreakContinuity()
   if not self.inSegment or self.continuityBroken then return end
   self.continuityBroken = true
+  self.continuityObservation = self.actualFight
   self.upgradePreviousEligible = false
   self.pressQueue = U.Deque:New()
   -- Keep segment totals, but a recommendation must be supported by fresh
@@ -232,6 +235,7 @@ function M:AnalyzeExactCycle(previousStart, previousDuration, currentStart)
   local micro = math.min(delay, cap)
   local afk = math.max(0, delay - micro)
   self.wastedGCD = self.wastedGCD + (micro / previousDuration)
+  self.afkTime = self.afkTime + afk
 
   local queueWindow = math.max(0, SafeGetCVarNumber("SpellQueueWindow", 400) / 1000)
   -- Do not let an oversized CVar reach into the previous action that started
@@ -277,6 +281,7 @@ function M:AnalyzeExactCycle(previousStart, previousDuration, currentStart)
       ready = ready,
       start = currentStart,
       press = onlyPress.t,
+      observation = self.actualFight,
     }, statisticLimit)
   end
 
@@ -290,9 +295,13 @@ function M:AnalyzeExactCycle(previousStart, previousDuration, currentStart)
 
   PushLimited(self.cycleLog, {
     t = currentStart,
+    observation = self.actualFight,
     delay = delay,
     afk = afk,
     qCov = queueCovered,
+    ambiguous = candidateCount > 1,
+    unobserved = candidateCount == 0,
+    queueLead = queued and (ready - onlyPress.t) or nil,
     queued = queued,
     late = late,
     lateDelay = lateDelay,
@@ -312,6 +321,12 @@ function M:OnGCDStart(startTime, duration, source)
   local previousSource = self.lastGCDSource
 
   self.actualFight = self.actualFight + 1
+  -- Bound evidence by all accepted starts, not just successful attribution.
+  -- Otherwise endless ambiguous/unobserved cycles keep an old SQW alive.
+  local cutoff = self.actualFight - (NS:GetConfig().statWindowN or 60)
+  self.cycleData:PopFrontWhile(function(cycle)
+    return cycle.observation <= cutoff
+  end)
   if source == U.GCD_SOURCE_DIRECT then
     self.directStarts = self.directStarts + 1
   else
@@ -383,53 +398,76 @@ end
 function M:ComputeContext(windowSeconds, now, cutoffEnd)
   now = now or Now()
   local endTime = cutoffEnd or self:GetEffectiveEnd(now)
-  local segmentStart = self.segmentStart or endTime
-  local startTime = segmentStart
-  if windowSeconds and windowSeconds > 0 then
-    startTime = math.max(segmentStart, endTime - windowSeconds)
-  end
+  local startTime = self.segmentStart or endTime
+  local rolling = windowSeconds and windowSeconds > 0
+  if rolling then startTime = math.max(startTime, endTime - windowSeconds) end
 
   local cycles, queued, late, queueCoverage = 0, 0, 0, 0
+  local ambiguous, unobserved = 0, 0
   local afkTime, afkGapCount, afkPressCount = 0, 0, 0
 
   self._contextGaps = self._contextGaps or {}
   self._contextLate = self._contextLate or {}
   self._contextQueueDelay = self._contextQueueDelay or {}
-  local gaps = self._contextGaps
-  local lateDelays = self._contextLate
-  local queueDelays = self._contextQueueDelay
+  self._contextLead = self._contextLead or {}
+  local gaps, lateDelays = self._contextGaps, self._contextLate
+  local queueDelays, leads = self._contextQueueDelay, self._contextLead
   ClearArray(gaps)
   ClearArray(lateDelays)
   ClearArray(queueDelays)
+  ClearArray(leads)
 
-  for cycle in self.cycleLog:Iter() do
-    if cycle.t >= startTime and cycle.t <= endTime then
-      cycles = cycles + 1
-      afkTime = afkTime + (cycle.afk or 0)
-      if cycle.queued then queued = queued + 1 end
-      if cycle.late then late = late + 1 end
-      if cycle.qCov then queueCoverage = queueCoverage + 1 end
-      if cycle.afkGap then afkGapCount = afkGapCount + 1 end
-      if cycle.afkPress then afkPressCount = afkPressCount + 1 end
-
-      gaps[#gaps + 1] = cycle.delay or 0
-      if cycle.late then lateDelays[#lateDelays + 1] = cycle.lateDelay or 0 end
-      if cycle.qDelay then queueDelays[#queueDelays + 1] = cycle.qDelay end
+  if not rolling and not cutoffEnd then
+    -- Segment counts are cumulative; the bounded log is only a rolling view.
+    -- Distribution samples remain bounded by statWindowN, not the fight length.
+    cycles, queued, late = self.cycleN, self.queuedN, self.lateN
+    queueCoverage = self.queueCovN
+    ambiguous, unobserved = self.ambiguousN, self.noneN
+    afkTime, afkGapCount, afkPressCount = self.afkTime, self.afkGapN, self.afkGapPressN
+    for value in self.gapFull:Iter() do gaps[#gaps + 1] = value end
+    for value in self.latePress:Iter() do lateDelays[#lateDelays + 1] = value end
+    for value in self.startDelayQueued:Iter() do queueDelays[#queueDelays + 1] = value end
+    for value in self.queueLead:Iter() do leads[#leads + 1] = value end
+  else
+    for cycle in self.cycleLog:Iter() do
+      if cycle.t >= startTime and cycle.t <= endTime
+        and (not rolling or cycle.observation > self.continuityObservation)
+      then
+        cycles = cycles + 1
+        afkTime = afkTime + (cycle.afk or 0)
+        if cycle.queued then queued = queued + 1 end
+        if cycle.late then late = late + 1 end
+        if cycle.ambiguous then ambiguous = ambiguous + 1 end
+        if cycle.unobserved then unobserved = unobserved + 1 end
+        if cycle.qCov then queueCoverage = queueCoverage + 1 end
+        if cycle.afkGap then afkGapCount = afkGapCount + 1 end
+        if cycle.afkPress then afkPressCount = afkPressCount + 1 end
+        gaps[#gaps + 1] = cycle.delay or 0
+        if cycle.late then lateDelays[#lateDelays + 1] = cycle.lateDelay or 0 end
+        if cycle.qDelay then queueDelays[#queueDelays + 1] = cycle.qDelay end
+        if cycle.queueLead then leads[#leads + 1] = cycle.queueLead end
+      end
     end
   end
 
-  if #gaps > 1 then table.sort(gaps) end
-  if #lateDelays > 1 then table.sort(lateDelays) end
-  if #queueDelays > 1 then table.sort(queueDelays) end
+  table.sort(gaps)
+  table.sort(lateDelays)
+  table.sort(queueDelays)
+  table.sort(leads)
 
+  local attributable = queued + late
   local output = self._contextOutput or {}
   self._contextOutput = output
+  output.cycles, output.attributable = cycles, attributable
+  output.queued, output.late = queued, late
+  output.ambiguous, output.unobserved = ambiguous, unobserved
   output.gapP90Sec = PercentileSorted(gaps, 0.90)
-  output.qHit = cycles > 0 and (queued / cycles) or 0
+  output.qHit = attributable > 0 and (queued / attributable) or 0
   output.qCov = cycles > 0 and (queueCoverage / cycles) or 0
-  output.lateShare = cycles > 0 and (late / cycles) or 0
+  output.lateShare = attributable > 0 and (late / attributable) or 0
   output.lateP90Ms = PercentileSorted(lateDelays, 0.90) * 1000
   output.qDelayP90Ms = PercentileSorted(queueDelays, 0.90) * 1000
+  output.queueLeadP90Ms = PercentileSorted(leads, 0.90) * 1000
   output.afkTime = afkTime
   output.afkDen = afkGapCount
   output.afkPressPct = afkGapCount > 0 and (afkPressCount / afkGapCount) or 0
@@ -457,27 +495,6 @@ function M:GetCurrentGap(atTime)
   return math.max(0, (atTime or Now()) - self.lastReadyTime)
 end
 
-local function StatsFromDeque(deque)
-  local values = DequeToArray(deque)
-  local count = #values
-  if count == 0 then return { mean = 0, median = 0, p90 = 0, n = 0 } end
-
-  local total = 0
-  for index = 1, count do total = total + values[index] end
-  if count > 1 then table.sort(values) end
-  return {
-    mean = total / count,
-    median = MedianSorted(values),
-    p90 = PercentileSorted(values, 0.90),
-    n = count,
-  }
-end
-
-function M:GetGapStatsFull() return StatsFromDeque(self.gapFull) end
-function M:GetQueueLeadStats() return StatsFromDeque(self.queueLead) end
-function M:GetStartDelayQueuedStats() return StatsFromDeque(self.startDelayQueued) end
-function M:GetLatePressStats() return StatsFromDeque(self.latePress) end
-
 function M:GetPressClassCounts()
   return {
     cycles = self.cycleN or 0,
@@ -503,25 +520,11 @@ function M:GetObservationCounts()
   }
 end
 
-function M:GetQueueCoverageShare()
-  local cycles = self.cycleN or 0
-  local count = self.queueCovN or 0
-  return count, cycles, cycles > 0 and (count / cycles) or 0
-end
-
-
 function M:GetAmbiguousShare()
   local cycles = self.cycleN or 0
   local count = self.ambiguousN or 0
   return count, cycles, cycles > 0 and (count / cycles) or 0
 end
-
-function M:GetAFKPressShare()
-  local denominator = self.afkGapN or 0
-  local count = self.afkGapPressN or 0
-  return count, denominator, denominator > 0 and (count / denominator) or 0
-end
-
 
 function M:RecommendSpellQueueWindow()
   local config = NS:GetConfig()
@@ -551,48 +554,53 @@ function M:RecommendSpellQueueWindow()
     return diagnostic.recommendedMs, diagnostic
   end
 
+  -- Use the same fresh evidence for the search, buffer and diagnostics.
+  -- Sorted leads turn the candidate scan into O(samples + candidates) instead
+  -- of rescanning every sample for every candidate window.
+  local leads = {}
+  for index = 1, count do
+    local cycle = cycles[index]
+    if cycle.press <= cycle.ready then
+      leads[#leads + 1] = (cycle.ready - cycle.press) * 1000
+    end
+  end
+  table.sort(leads)
+  local medianLeadMs = MedianSorted(leads)
+  diagnostic.medianLeadMs = medianLeadMs
+  if #leads == 0 then
+    diagnostic.noQueueEvidence = true
+    diagnostic.coverage, diagnostic.noQueue = 0, 1
+    return nil, diagnostic
+  end
+
   local minimum = math.floor(math.max(50, latency * (config.recommendLatencyFactor or 0.9)))
   local maximum = config.recommendMaxMs or 400
   local step = config.recommendStepMs or 5
   if minimum > maximum then minimum = maximum end
 
-  local bestWindow, bestScore, bestCoverage = nil, -math.huge, 0
-  for windowMs = minimum, maximum, step do
-    local window = windowMs / 1000
-    local covered = 0
-    for index = 1, count do
-      local cycle = cycles[index]
-      if cycle.press >= (cycle.ready - window) and cycle.press <= cycle.ready then
-        covered = covered + 1
-      end
+  local bestWindow, bestScore, covered = minimum, -math.huge, 0
+  for candidate = 0, math.ceil((maximum - minimum) / step) do
+    local windowMs = math.min(maximum, minimum + candidate * step)
+    while covered < #leads and leads[covered + 1] <= windowMs + 1e-6 do
+      covered = covered + 1
     end
-    local coverage = count > 0 and (covered / count) or 0
-    local score = coverage - (windowMs / 10000)
+    local score = covered / count - (windowMs / 10000)
     if score > bestScore then
-      bestWindow = windowMs
-      bestScore = score
-      bestCoverage = coverage
+      bestWindow, bestScore = windowMs, score
     end
   end
 
-  if not bestWindow then bestWindow = math.min(400, maximum) end
-
-  local leads = DequeToArray(self.queueLead)
-  table.sort(leads)
-  local medianLeadMs = 0
-  if #leads > 0 then
-    medianLeadMs = leads[math.floor((#leads + 1) / 2)] * 1000
-  end
   local buffer = config.recommendLeadBufferMs
   if buffer == nil then buffer = math.floor(math.max(20, math.min(80, medianLeadMs))) end
-
-  local recommendation = math.max(bestWindow, math.floor(latency + buffer))
-  recommendation = U.Clamp(recommendation, 0, maximum)
+  local recommendation = U.Clamp(math.max(bestWindow, math.floor(latency + buffer)), 0, maximum)
+  covered = 0
+  while covered < #leads and leads[covered + 1] <= recommendation + 1e-6 do
+    covered = covered + 1
+  end
 
   diagnostic.bestScore = bestScore
-  diagnostic.coverage = bestCoverage
-  diagnostic.noQueue = 1 - bestCoverage
-  diagnostic.medianLeadMs = medianLeadMs
+  diagnostic.coverage = covered / count
+  diagnostic.noQueue = 1 - diagnostic.coverage
   diagnostic.extraMs = buffer
   diagnostic.recommendedMs = recommendation
   return recommendation, diagnostic

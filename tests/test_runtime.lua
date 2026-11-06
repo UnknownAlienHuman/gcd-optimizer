@@ -244,6 +244,9 @@ check(#refreshed == 1, "unchanged direct polls do not spam duration refreshes")
 NS.GCDDetector:AcceptStart(20.12, 1.4, U.GCD_SOURCE_ESTIMATED)
 close(NS.GCDDetector.lastCountedDuration, 0.8, 1e-9, "estimated timing cannot downgrade exact timing")
 
+cooldown = { isActive = true, startTime = 29, duration = 0.8, modRate = 1.0 }
+NS.GCDEstimator:GetPrediction()
+
 -- Manual start inside a restricted active GCD must wait for a post-start
 -- inactive transition before it can claim an estimated cycle.
 local beforeManualPrime = #accepted

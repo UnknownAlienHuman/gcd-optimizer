@@ -9,11 +9,11 @@ NS.HUD = NS.HUD or {}
 local H = NS.HUD
 
 local ANALYSIS_REFRESH_INTERVAL = 1.0
+local VERDICT_WINDOW_SECONDS = 10.0
 
 local TAG_COLORS = {
   ["OK"] = "33ff66",
   ["Low sample"] = "ffff55",
-  ["Stop sleeping!"] = "ff3333",
   ["Bad management"] = "ff9933",
   ["Bad server!"] = "cc77ff",
   ["Press faster!"] = "ff5555",
@@ -76,51 +76,30 @@ local function FailureLabel(category)
   return NS:L("FAILTAG_OTHER", "other")
 end
 
-local function BuildVerdict(snapshot)
-  local lowSample = (snapshot.elapsedSec or 0) < 10
-    or (snapshot.exactCycles or 0) < 5
-
-  local tag = "OK"
-  local reason = nil
-  if snapshot.inCombat and (snapshot.idleSec or 0) >= 2 then
-    tag = "Stop sleeping!"
-    reason = string.format("%s %.1fs", NS:L("ANL_IDLE", "Idle"), snapshot.idleSec)
-  elseif (snapshot.attributable or 0) >= 6
-    and (snapshot.queueHit or 0) >= 0.65
-    and (snapshot.lateShare or 0) < 0.25
-    and (snapshot.queueDelayP90Ms or 0) >= 220
-  then
-    tag = "Bad server!"
-    reason = string.format("%s %.0fms", NS:L("MET_SDQ_P90", "Queued-start delay p90"), snapshot.queueDelayP90Ms)
-  elseif ((snapshot.exactCycles or 0) >= 5 and (snapshot.ambiguousShare or 0) >= 0.20)
-    or ((snapshot.afkDen or 0) >= 3 and (snapshot.afkPressPct or 0) >= 0.45)
-    or ((snapshot.failureTotal or 0) >= 3 and (snapshot.afkTime or 0) >= 0.7)
-  then
-    tag = "Bad management"
-    if (snapshot.ambiguousShare or 0) >= 0.20 then
-      reason = string.format("%s %s", NS:L("MET_AMBIGUOUS", "Ambiguous input"), Percent(snapshot.ambiguousShare))
-    elseif (snapshot.afkDen or 0) >= 3 then
-      reason = string.format("%s %s", NS:L("MET_AFK_PRESS", "Pressing during gaps"), Percent(snapshot.afkPressPct))
-    else
-      reason = string.format("%s %d", NS:L("MET_FAIL_TOTAL", "Failed attempts"), snapshot.failureTotal or 0)
-    end
-  elseif (snapshot.lateShare or 0) >= 0.35
-    or (snapshot.gapP90Ms or 0) >= 150
-    or (snapshot.wastedPerMinute or 0) >= 4
-  then
-    tag = "Press faster!"
-    if (snapshot.lateShare or 0) >= 0.35 then
-      reason = string.format("%s %s", NS:L("MET_LATE_SHARE", "Late input"), Percent(snapshot.lateShare))
-    else
-      reason = string.format("%s %.0fms", NS:L("MET_GAP_P90", "Gap p90"), snapshot.gapP90Ms or 0)
-    end
+local function BuildVerdict(context, failure, elapsed)
+  -- A missing hook is not proof of inactivity; ambiguity is an evidence limit,
+  -- not a player mistake. Every threshold uses one coherent sample window.
+  if elapsed < 10 or context.attributable < 5 then
+    return "Low sample", ColorVerdict("Low sample")
   end
 
-  if lowSample then
-    local text = ColorVerdict("Low sample")
-    if tag ~= "OK" then text = text .. " · " .. ColorVerdict(tag) end
-    if reason then text = text .. " (" .. reason .. ")" end
-    return "Low sample", text
+  local tag, reason = "OK", nil
+  if context.attributable >= 6 and context.qHit >= 0.65
+    and context.lateShare < 0.25 and context.qDelayP90Ms >= 220
+  then
+    tag = "Bad server!"
+    reason = string.format("%s %.0fms", NS:L("MET_SDQ_P90", "Queued-start delay p90"), context.qDelayP90Ms)
+  elseif (context.afkDen >= 3 and context.afkPressPct >= 0.45)
+    or ((failure.total or 0) >= 3 and context.afkTime >= 0.7)
+  then
+    tag = "Bad management"
+    reason = string.format("%s %d", NS:L("MET_FAIL_TOTAL", "Failed attempts"), failure.total or 0)
+    if context.afkDen >= 3 then
+      reason = string.format("%s %s", NS:L("MET_AFK_PRESS", "Pressing during gaps"), Percent(context.afkPressPct))
+    end
+  elseif context.lateShare >= 0.35 then
+    tag = "Press faster!"
+    reason = string.format("%s %s", NS:L("MET_LATE_SHARE", "Late input"), Percent(context.lateShare))
   end
 
   local text = ColorVerdict(tag)
@@ -223,8 +202,19 @@ function H:Init()
   end)
   self.combatFrame = combatFrame
 
+  mini:SetScript("OnHide", function()
+    self:StopTicker()
+    self:HideTransientWindows()
+  end)
+  mini:SetScript("OnShow", function() self:StartTicker() end)
   mini:SetShown(NS:GetConfig().showHUD)
   self:Update(true)
+end
+
+function H:HideTransientWindows()
+  self:SetDetailsShown(false)
+  if self.contextMenu then self.contextMenu:Hide() end
+  if self.sqwPopup then self.sqwPopup:Hide() end
 end
 
 function H:SetDetailsShown(shown)
@@ -268,6 +258,9 @@ function H:ShowContextMenu()
     {
       text = running and NS:L("MENU_STOP", "Stop") or NS:L("MENU_START", "Start"),
       action = function()
+        -- The menu may outlive a combat transition. A stale Start/Stop must not
+        -- take ownership of a segment created since the menu was opened.
+        if running ~= (NS.state and NS.state.inSegment) then return end
         NS.state.autoCombat = false
         if running then NS:PauseSegment(Now()) else NS:StartSegment(Now()) end
       end,
@@ -528,17 +521,9 @@ end
 
 function H:CollectAnalysis(now, inSegment, inCombat)
   local metrics = NS.Metrics
-  local contextWindow = inSegment and inCombat and 5.0 or nil
+  local contextWindow = inSegment and inCombat and VERDICT_WINDOW_SECONDS or nil
   local context = metrics:ComputeContext(contextWindow, now)
-  local classes = metrics:GetPressClassCounts()
   local observations = metrics:GetObservationCounts()
-  local gapStats = metrics:GetGapStatsFull()
-  local leadStats = metrics:GetQueueLeadStats()
-  local lateStats = metrics:GetLatePressStats()
-  local queueDelayStats = metrics:GetStartDelayQueuedStats()
-  local _, _, queueCoverage = metrics:GetQueueCoverageShare()
-  local _, afkDen, afkPressPct = metrics:GetAFKPressShare()
-
   local recommendation, recommendationInfo = metrics:RecommendSpellQueueWindow()
   if recommendationInfo.lowSample then recommendation = nil end
 
@@ -551,20 +536,32 @@ function H:CollectAnalysis(now, inSegment, inCombat)
     end
   end
 
+  local verdict, text = BuildVerdict(context, failure, metrics:GetFightDuration(now))
+  local status = NS.GCDDetector.lastStatus
+  if inSegment and (metrics.continuityBroken
+    or (status ~= U.GCD_STATUS_EXACT and status ~= U.GCD_STATUS_INACTIVE))
+  then
+    recommendation = nil
+    verdict, text = "Low sample", ColorVerdict("Low sample")
+  end
+
   return {
     inSegment = inSegment,
     inCombat = inCombat,
+    continuityBroken = metrics.continuityBroken,
     recommendedMs = recommendation,
-    gapP90Ms = (context.gapP90Sec or gapStats.p90 or 0) * 1000,
-    queueHit = context.qHit or 0,
-    queueCoverage = context.qCov or queueCoverage or 0,
-    queueLeadP90Ms = (leadStats.p90 or 0) * 1000,
-    queueDelayP90Ms = context.qDelayP90Ms or ((queueDelayStats.p90 or 0) * 1000),
-    lateShare = context.lateShare or 0,
-    lateP90Ms = context.lateP90Ms or ((lateStats.p90 or 0) * 1000),
-    afkTime = context.afkTime or 0,
-    afkDen = context.afkDen or afkDen or 0,
-    afkPressPct = context.afkPressPct or afkPressPct or 0,
+    verdictTag = verdict,
+    analysisText = text,
+    gapP90Ms = context.gapP90Sec * 1000,
+    queueHit = context.qHit,
+    queueCoverage = context.qCov,
+    queueLeadP90Ms = context.queueLeadP90Ms,
+    queueDelayP90Ms = context.qDelayP90Ms,
+    lateShare = context.lateShare,
+    lateP90Ms = context.lateP90Ms,
+    afkTime = context.afkTime,
+    afkDen = context.afkDen,
+    afkPressPct = context.afkPressPct,
     observedTotal = observations.total or 0,
     directStarts = observations.direct or 0,
     estimatedStarts = observations.estimated or 0,
@@ -572,8 +569,6 @@ function H:CollectAnalysis(now, inSegment, inCombat)
     attributable = observations.attributable or 0,
     ambiguous = observations.ambiguous or 0,
     unobserved = observations.unobserved or 0,
-    ambiguousShare = (classes.cycles or 0) > 0
-      and ((classes.ambiguous or 0) / classes.cycles) or 0,
     failureTotal = failure.total or 0,
     failureTop = failure.topCat or "OTH",
     failureTopShare = failure.topShare or 0,
@@ -583,7 +578,8 @@ end
 function H:GetAnalysis(now, inSegment, inCombat, force)
   local cache = self.analysisCache
   local stateChanged = cache
-    and (cache.inSegment ~= inSegment or cache.inCombat ~= inCombat)
+    and (cache.inSegment ~= inSegment or cache.inCombat ~= inCombat
+      or cache.continuityBroken ~= NS.Metrics.continuityBroken)
   if force or not cache or stateChanged or now >= (self.nextAnalysisAt or 0) then
     cache = self:CollectAnalysis(now, inSegment, inCombat)
     self.analysisCache = cache
@@ -593,14 +589,14 @@ function H:GetAnalysis(now, inSegment, inCombat, force)
 end
 
 function H:Update(force)
-  if not (self.frame and self.frame:IsShown()) then return end
+  if not (self.frame and self.frame:IsVisible()) then return end
   local metrics = NS.Metrics
   local integrator = NS.Integrator
   if not (metrics and integrator and NS.GCDDetector) then return end
 
   local now = Now()
   local inSegment = NS.state and NS.state.inSegment or false
-  local inCombat = UnitAffectingCombat and UnitAffectingCombat("player") or false
+  local inCombat = InCombatLockdown()
   local duration = metrics:GetFightDuration(now)
   local predicted, predictionSource = integrator:GetCurrentPrediction()
   local _, liveDuration, liveSource = NS.GCDDetector:GetLiveGCDInfo()
@@ -616,11 +612,8 @@ function H:Update(force)
   local analysis = self:GetAnalysis(now, inSegment, inCombat, force)
 
   local wasted = metrics:GetWastedGCD()
-  local idle = metrics:GetSecondsSinceLastPress(now)
   local snapshot = {
     duration = duration,
-    elapsedSec = duration,
-    inCombat = inCombat,
     source = source,
     gcdMs = gcdDuration and (gcdDuration * 1000) or nil,
     sqwMs = SafeGetCVarNumber("SpellQueueWindow", 400),
@@ -630,7 +623,6 @@ function H:Update(force)
     efficiency = efficiency,
     lost = lost,
     wasted = wasted,
-    wastedPerMinute = duration > 0 and (wasted * 60 / duration) or 0,
     gapP90Ms = analysis.gapP90Ms,
     gapNow = inSegment and metrics:GetCurrentGap(now) or 0,
     queueHit = analysis.queueHit,
@@ -642,7 +634,6 @@ function H:Update(force)
     afkTime = analysis.afkTime,
     afkDen = analysis.afkDen,
     afkPressPct = analysis.afkPressPct,
-    idleSec = idle and math.min(idle, 999) or nil,
     observedTotal = analysis.observedTotal,
     directStarts = analysis.directStarts,
     estimatedStarts = analysis.estimatedStarts,
@@ -650,32 +641,43 @@ function H:Update(force)
     attributable = analysis.attributable,
     ambiguous = analysis.ambiguous,
     unobserved = analysis.unobserved,
-    ambiguousShare = analysis.ambiguousShare,
     failureTotal = analysis.failureTotal,
     failureTop = analysis.failureTop,
     failureTopShare = analysis.failureTopShare,
   }
 
-  snapshot.verdictTag, snapshot.analysisText = BuildVerdict(snapshot)
+  snapshot.verdictTag, snapshot.analysisText = analysis.verdictTag, analysis.analysisText
   self.lastSnapshot = snapshot
   self:RenderMini(snapshot)
   self:RenderDetails(snapshot)
 end
 
 function H:StartTicker()
-  if self.ticker then self.ticker:Cancel(); self.ticker = nil end
-  if not (self.frame and self.frame:IsShown()) then return end
-  if not (NS.state and NS.state.inSegment) then
+  if not (self.frame and self.frame:IsVisible() and NS.state and NS.state.inSegment) then
+    self:StopTicker()
     self:Update(true)
     return
   end
 
   local interval = U.Clamp(NS:GetConfig().hudUpdateInterval or 0.25, 0.10, 1.00)
-  self.ticker = C_Timer.NewTicker(interval, function() self:Update(false) end)
+  if self.ticker and self.tickerInterval == interval then return end
+  self:StopTicker()
+  local generation = self.tickerGeneration
+  self.tickerInterval = interval
+  self.ticker = C_Timer.NewTicker(interval, function()
+    if generation ~= self.tickerGeneration then return end
+    if not (NS.state.inSegment and self.frame:IsVisible()) then
+      self:StopTicker()
+      return
+    end
+    self:Update(false)
+  end)
 end
 
 function H:StopTicker()
+  self.tickerGeneration = (self.tickerGeneration or 0) + 1
   if self.ticker then self.ticker:Cancel(); self.ticker = nil end
+  self.tickerInterval = nil
 end
 
 function H:OnSegmentStart()

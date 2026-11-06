@@ -64,6 +64,7 @@ local function NewFrame()
   function methods:HookScript(kind, callback) self.scripts["hook_" .. kind] = callback end
   function methods:SetShown(shown) self.shown = shown and true or false end
   function methods:IsShown() return self.shown end
+  function methods:IsVisible() return self.shown end
   function methods:Show() self.shown = true end
   function methods:Hide() self.shown = false end
   function methods:CreateFontString() return NewFontString() end

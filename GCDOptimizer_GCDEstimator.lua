@@ -101,6 +101,13 @@ function E:ObserveDirect(duration, observedAt, startTime)
   local isNewStart = not startTime
     or not self.lastDirectStart
     or math.abs(startTime - self.lastDirectStart) > 0.05
+  if not isNewStart and self.calibrationGCD
+    and math.abs(duration - self.calibrationGCD) > 0.001
+  then
+    -- A same-start correction no longer matches the original swing pair.
+    -- Do not pair it with a later swing: wait for a fresh exact start.
+    self:InvalidateCalibration("duration_changed")
+  end
   self.lastStable = duration
   self.lastPred = duration
   self.source = U.GCD_SOURCE_DIRECT
