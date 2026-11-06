@@ -433,6 +433,7 @@ function H:RenderDetails(snapshot)
   Value(NS:L("MET_ATTRIBUTABLE", "Attributable cycles"), Number(snapshot.attributable))
   Value(NS:L("MET_AMBIGUOUS", "Ambiguous cycles"), Number(snapshot.ambiguous))
   Value(NS:L("MET_UNOBSERVED", "Unobserved input"), Number(snapshot.unobserved))
+  Value(NS:L("MET_INCOMPLETE", "Incomplete input history"), Number(snapshot.incomplete))
 
   Header(NS:L("SEC_LOSSES", "Cadence"))
   Value(NS:L("MET_EFF", "Efficiency"), Percent(snapshot.efficiency, 1))
@@ -569,6 +570,7 @@ function H:CollectAnalysis(now, inSegment, inCombat)
     attributable = observations.attributable or 0,
     ambiguous = observations.ambiguous or 0,
     unobserved = observations.unobserved or 0,
+    incomplete = observations.incomplete or 0,
     failureTotal = failure.total or 0,
     failureTop = failure.topCat or "OTH",
     failureTopShare = failure.topShare or 0,
@@ -641,6 +643,7 @@ function H:Update(force)
     attributable = analysis.attributable,
     ambiguous = analysis.ambiguous,
     unobserved = analysis.unobserved,
+    incomplete = analysis.incomplete,
     failureTotal = analysis.failureTotal,
     failureTop = analysis.failureTop,
     failureTopShare = analysis.failureTopShare,

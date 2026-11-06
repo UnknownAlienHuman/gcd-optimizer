@@ -75,6 +75,19 @@ function E:Reset()
   self:ResetSegment()
 end
 
+-- Prepare the fallback before the first restricted fight without collecting
+-- metrics outside a segment. An old active cooldown cannot calibrate today's
+-- swing speed: only a near-start ordinary observation is paired.
+function E:CalibrateOutOfCombat()
+  if type(InCombatLockdown) ~= "function" or InCombatLockdown() then return end
+  local status, startTime, duration = U.ReadGCDObservation()
+  if status ~= U.GCD_STATUS_EXACT then return end
+  local now = Now()
+  local age = now - startTime
+  if age < 0 or age > 0.25 then return end
+  self:ObserveDirect(duration, now, startTime)
+end
+
 function E:OnSegmentStart()
   self:ResetSegment()
   local status, startTime, duration = U.ReadGCDObservation()

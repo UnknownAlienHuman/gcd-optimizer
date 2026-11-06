@@ -67,11 +67,18 @@ local function MedianSorted(values)
 end
 
 local function EstimateSystemDelaySec(self, config)
-  local samples = DequeToArray(self.startDelayQueued)
+  -- Distribution history is retained for reports; calibration uses only the
+  -- fresh, complete input evidence that also supports SQW recommendations.
+  local samples = {}
+  for cycle in self.cycleData:Iter() do
+    if cycle.press <= cycle.ready then
+      samples[#samples + 1] = math.max(0, cycle.start - cycle.ready)
+    end
+  end
   if #samples >= (config.sysDelayMinSamples or 6) then
     table.sort(samples)
     local median = MedianSorted(samples)
-    if median > 0 and median < 1 then
+    if median >= 0 and median < 1 then
       return median
     end
   end
@@ -130,6 +137,7 @@ function M:Reset()
   self.lastGCDSource = nil
   self.lastReadyTime = nil
   self.lastPressAt = nil
+  self.discardedPressThrough = nil
 
   self.upgradePreviousStart = nil
   self.upgradePreviousDuration = nil
@@ -151,6 +159,7 @@ function M:Reset()
   self.lateN = 0
   self.noneN = 0
   self.ambiguousN = 0
+  self.incompleteN = 0
   self.attributableN = 0
   self.queueCovN = 0
   self.afkGapN = 0
@@ -167,12 +176,18 @@ function M:GetLastActionTime()
   return math.max(self.lastGCDStart or 0, self.lastPressAt or 0)
 end
 
+local function ClearPressHistory(self)
+  local last = self.pressQueue:Back()
+  if last then self.discardedPressThrough = last.t end
+  self.pressQueue = U.Deque:New()
+end
+
 function M:BreakContinuity()
   if not self.inSegment or self.continuityBroken then return end
   self.continuityBroken = true
   self.continuityObservation = self.actualFight
   self.upgradePreviousEligible = false
-  self.pressQueue = U.Deque:New()
+  ClearPressHistory(self)
   -- Keep segment totals, but a recommendation must be supported by fresh
   -- attributable cycles after the observation boundary.
   self.cycleData = U.Deque:New()
@@ -199,7 +214,8 @@ function M:ReanchorStart(startTime)
 end
 
 function M:OnPress(timestamp)
-  if not self.inSegment then return end
+  if not self.inSegment or not ValidTiming(timestamp) then return end
+  if self.lastPressAt and timestamp < self.lastPressAt then return end
 
   local config = NS:GetConfig()
   local keepSeconds = config.pressBufferSeconds or 8.0
@@ -207,10 +223,13 @@ function M:OnPress(timestamp)
 
   self.pressQueue:PushBack({ t = timestamp })
   self.lastPressAt = timestamp
-  self.pressQueue:PopFrontWhile(function(press)
-    return press.t < (timestamp - keepSeconds)
-  end)
-  while self.pressQueue:Size() > maximum do self.pressQueue:PopFront() end
+  -- Retain a coverage watermark as well as the bounded records. Otherwise
+  -- evicting one candidate can make a multi-press cycle look uniquely matched.
+  while self.pressQueue:Size() > 0 do
+    local first = self.pressQueue:Front()
+    if first.t >= timestamp - keepSeconds and self.pressQueue:Size() <= maximum then break end
+    self.discardedPressThrough = self.pressQueue:PopFront().t
+  end
 end
 
 function M:AnalyzeExactCycle(previousStart, previousDuration, currentStart)
@@ -242,6 +261,8 @@ function M:AnalyzeExactCycle(previousStart, previousDuration, currentStart)
   -- this GCD. The next-action attribution window begins strictly after the
   -- previous start, even when a user or external addon sets an extreme value.
   local attributionStart = math.max(previousStart + 0.001, ready - queueWindow)
+  local historyComplete = not self.discardedPressThrough
+    or self.discardedPressThrough < attributionStart
   local candidateCount, queuedCount, _, onlyPress = CountPresses(
     self,
     attributionStart,
@@ -257,7 +278,9 @@ function M:AnalyzeExactCycle(previousStart, previousDuration, currentStart)
   local lateDelay = 0
   local queueDelay = nil
 
-  if candidateCount == 0 then
+  if not historyComplete then
+    self.incompleteN = self.incompleteN + 1
+  elseif candidateCount == 0 then
     self.noneN = self.noneN + 1
   elseif candidateCount > 1 then
     self.ambiguousN = self.ambiguousN + 1
@@ -285,7 +308,7 @@ function M:AnalyzeExactCycle(previousStart, previousDuration, currentStart)
     }, statisticLimit)
   end
 
-  local isAfkGap = delay > (cap + 1e-6)
+  local isAfkGap = historyComplete and delay > (cap + 1e-6)
   local afkPress = false
   if isAfkGap then
     afkPress = HasPressBetween(self, ready + cap, currentStart)
@@ -299,8 +322,9 @@ function M:AnalyzeExactCycle(previousStart, previousDuration, currentStart)
     delay = delay,
     afk = afk,
     qCov = queueCovered,
-    ambiguous = candidateCount > 1,
-    unobserved = candidateCount == 0,
+    incomplete = not historyComplete,
+    ambiguous = historyComplete and candidateCount > 1,
+    unobserved = historyComplete and candidateCount == 0,
     queueLead = queued and (ready - onlyPress.t) or nil,
     queued = queued,
     late = late,
@@ -338,7 +362,7 @@ function M:OnGCDStart(startTime, duration, source)
   self.upgradePreviousEligible = not self.continuityBroken
 
   if self.continuityBroken then
-    self.pressQueue = U.Deque:New()
+    ClearPressHistory(self)
   end
   if previousStart then
     if not self.continuityBroken
@@ -403,7 +427,7 @@ function M:ComputeContext(windowSeconds, now, cutoffEnd)
   if rolling then startTime = math.max(startTime, endTime - windowSeconds) end
 
   local cycles, queued, late, queueCoverage = 0, 0, 0, 0
-  local ambiguous, unobserved = 0, 0
+  local ambiguous, unobserved, incomplete = 0, 0, 0
   local afkTime, afkGapCount, afkPressCount = 0, 0, 0
 
   self._contextGaps = self._contextGaps or {}
@@ -422,7 +446,7 @@ function M:ComputeContext(windowSeconds, now, cutoffEnd)
     -- Distribution samples remain bounded by statWindowN, not the fight length.
     cycles, queued, late = self.cycleN, self.queuedN, self.lateN
     queueCoverage = self.queueCovN
-    ambiguous, unobserved = self.ambiguousN, self.noneN
+    ambiguous, unobserved, incomplete = self.ambiguousN, self.noneN, self.incompleteN
     afkTime, afkGapCount, afkPressCount = self.afkTime, self.afkGapN, self.afkGapPressN
     for value in self.gapFull:Iter() do gaps[#gaps + 1] = value end
     for value in self.latePress:Iter() do lateDelays[#lateDelays + 1] = value end
@@ -437,6 +461,7 @@ function M:ComputeContext(windowSeconds, now, cutoffEnd)
         afkTime = afkTime + (cycle.afk or 0)
         if cycle.queued then queued = queued + 1 end
         if cycle.late then late = late + 1 end
+        if cycle.incomplete then incomplete = incomplete + 1 end
         if cycle.ambiguous then ambiguous = ambiguous + 1 end
         if cycle.unobserved then unobserved = unobserved + 1 end
         if cycle.qCov then queueCoverage = queueCoverage + 1 end
@@ -460,7 +485,7 @@ function M:ComputeContext(windowSeconds, now, cutoffEnd)
   self._contextOutput = output
   output.cycles, output.attributable = cycles, attributable
   output.queued, output.late = queued, late
-  output.ambiguous, output.unobserved = ambiguous, unobserved
+  output.ambiguous, output.unobserved, output.incomplete = ambiguous, unobserved, incomplete
   output.gapP90Sec = PercentileSorted(gaps, 0.90)
   output.qHit = attributable > 0 and (queued / attributable) or 0
   output.qCov = cycles > 0 and (queueCoverage / cycles) or 0
@@ -503,6 +528,7 @@ function M:GetPressClassCounts()
     none = self.noneN or 0,
     unobserved = self.noneN or 0,
     ambiguous = self.ambiguousN or 0,
+    incomplete = self.incompleteN or 0,
     attributable = self.attributableN or 0,
   }
 end
@@ -516,6 +542,7 @@ function M:GetObservationCounts()
     ineligibleCycles = self.ineligibleCycles or 0,
     attributable = self.attributableN or 0,
     ambiguous = self.ambiguousN or 0,
+    incomplete = self.incompleteN or 0,
     unobserved = self.noneN or 0,
   }
 end

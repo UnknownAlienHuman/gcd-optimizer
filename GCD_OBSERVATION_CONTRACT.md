@@ -37,7 +37,7 @@ Duration is:
 calibratedGCD * currentSwing / calibratedSwing
 ```
 
-The source is always `ESTIMATED_SWING`. Equipment/spec changes invalidate the calibration.
+The source is always `ESTIMATED_SWING`. Equipment/spec changes invalidate the calibration. While idle and explicitly outside combat, `SPELL_UPDATE_COOLDOWN` may calibrate a direct GCD/swing pair observed within 250 ms of its start. This creates no segment, metric or timer; inaccessible or stale observations do not calibrate.
 
 ## Cached state
 
@@ -50,7 +50,7 @@ A last stable/default duration may keep the HUD readable, but `CACHED_LOW_CONFID
 
 ## Input attribution
 
-For each exact-to-exact cycle, consider local presses in the attribution window:
+For each exact-to-exact cycle, first require complete retained press history for the attribution window. Age/capacity eviction and boundary clearing retain a timestamp watermark. An overlapping window is `incomplete_input`, separately counted and excluded from latency/SQW and absence-of-input gap diagnostics. Ordinary cadence counts remain valid. With complete history:
 
 - zero candidates → `unobserved_input`;
 - one candidate → eligible exact queue/late attribution;
@@ -60,7 +60,7 @@ Unobserved and ambiguous cycles remain useful for aggregate cadence/press-densit
 
 ## Analysis windows
 
-SQW evidence is bounded by the latest `statWindowN` accepted starts, not the latest successful attributions alone. Ambiguous, unobserved and estimated starts age earlier samples. The lead buffer and candidate search use this same fresh sample set; late-only samples do not establish a usable queue window. Search includes its upper bound even when the step does not divide the range.
+SQW evidence is bounded by the latest `statWindowN` accepted starts, not the latest successful attributions alone. Ambiguous, unobserved and estimated starts age earlier samples. The system-delay estimate, lead buffer and candidate search use this same fresh sample set; measured zero delay is valid; late-only samples do not establish a usable queue window. Search includes its upper bound even when the step does not divide the range.
 
 Live verdicts use a ten-second window and at least five attributable cycles in that window after the latest continuity boundary. Missing/old hook evidence is not inactivity, and ambiguity is not a player-error verdict. Final verdicts use the closed segment, not later combat or elapsed wall time.
 

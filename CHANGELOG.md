@@ -2,6 +2,15 @@
 
 ## Unreleased — 2026-11-06
 
+### Input history and startup repair
+
+- Track discarded press timestamps. Truncated input history is reported separately and excluded from latency, SQW and absence-of-input gap diagnostics; cadence counts remain intact.
+- Calibrate from fresh accessible out-of-combat cooldown events even without an active segment, so the first restricted fight can use an existing swing pair. No idle ticker or estimated start is introduced.
+- Handle reload into combat at world readiness without overriding manual pause or an existing manual segment.
+- Sanitize saved minimap angles before LibDBIcon consumes them, preserving other settings.
+- Estimate system delay from the same fresh evidence as SQW, not pre-boundary distribution history; a measured zero delay is valid.
+- Add `tests/test_ingress.lua`: 24 cases / 304 assertions. All five suites pass under standalone Lua 5.3 and 5.4. Live client/taint/rendering/performance remain NOT-RUN.
+
 ### Analytics and HUD follow-up
 
 - Age SQW evidence by all recent accepted starts, including ambiguous/unobserved input. Use the same fresh sample set for search and lead buffer; late-only input no longer produces a queue-window recommendation.

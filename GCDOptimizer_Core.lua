@@ -128,7 +128,9 @@ local function SanitizeConfig(config)
   ClampNumber(config, "microCapMax", config.microCapMin, 1.50, 0.40)
 
   if type(config.minimap) ~= "table" then config.minimap = { hide = false } end
-  config.minimap.hide = config.minimap.hide and true or false
+  config.minimap.hide = config.minimap.hide == true
+  local minimapPosition = tonumber(config.minimap.minimapPos)
+  config.minimap.minimapPos = U.IsFiniteNumber(minimapPosition) and (minimapPosition % 360) or 225
   if type(config.localeOverride) ~= "string" then config.localeOverride = "auto" end
   if type(config.anchors) ~= "table" then config.anchors = {} end
   config.anchors = MergeDefaults(config.anchors, DEFAULTS.anchors)
@@ -367,6 +369,7 @@ end
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("PLAYER_LOGIN")
+eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
 eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
 eventFrame:SetScript("OnEvent", function(_, event, addonName)
@@ -374,6 +377,13 @@ eventFrame:SetScript("OnEvent", function(_, event, addonName)
     if addonName == ADDON_NAME then NS:Init() end
   elseif event == "PLAYER_LOGIN" then
     NS:Init()
+  elseif event == "PLAYER_ENTERING_WORLD" then
+    NS:Init()
+    -- Reloading during combat does not replay PLAYER_REGEN_DISABLED. Preserve
+    -- a deliberate pause and an existing manual segment on later world entry.
+    if not NS.state.manualPaused and InCombatLockdown and InCombatLockdown() then
+      NS:OnCombatStart()
+    end
   elseif event == "PLAYER_REGEN_DISABLED" then
     NS:OnCombatStart()
   elseif event == "PLAYER_REGEN_ENABLED" then
@@ -399,7 +409,7 @@ local function PrintDebug()
   local detector = NS.GCDDetector and NS.GCDDetector:DebugSnapshot() or {}
   local observations = NS.Metrics and NS.Metrics:GetObservationCounts() or {}
   Print(string.format(
-    "version=%s gcd=%.3f source=%s direct=%d estimated=%d exactCycles=%d attributed=%d ambiguous=%d status=%s",
+    "version=%s gcd=%.3f source=%s direct=%d estimated=%d exactCycles=%d attributed=%d ambiguous=%d incomplete=%d status=%s",
     NS.VERSION,
     estimator.lastPred or 0,
     tostring(estimator.source or U.GCD_SOURCE_CACHED),
@@ -408,6 +418,7 @@ local function PrintDebug()
     observations.exactCycles or 0,
     observations.attributable or 0,
     observations.ambiguous or 0,
+    observations.incomplete or 0,
     tostring(detector.status or U.GCD_STATUS_UNAVAILABLE)
   ))
 end

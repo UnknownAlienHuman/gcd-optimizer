@@ -45,7 +45,12 @@ function D:Init()
   frame:RegisterEvent("SPELL_SECRECY_CHANGED")
   frame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
   frame:SetScript("OnEvent", function(_, event)
-    if not (NS.state and NS.state.inSegment) then return end
+    if not (NS.state and NS.state.inSegment) then
+      if event == "SPELL_UPDATE_COOLDOWN" and NS.GCDEstimator then
+        NS.GCDEstimator:CalibrateOutOfCombat()
+      end
+      return
+    end
 
     local eventTime = Now()
     self:Observe(event)
