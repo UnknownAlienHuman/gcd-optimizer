@@ -1,62 +1,60 @@
 # Architecture
 
-## Composition root
+## Ownership
 
-`GCDOptimizer_Core.lua` loads last and owns `GCDOptimizerDB`, schema/default migration, module initialization, segment lifecycle, combat automation, HUD visibility, and the sole `/gcdopt` dispatcher.
+`GCDOptimizer_Core.lua` is the composition root. It owns configuration migration, segment lifecycle, combat automation, HUD visibility, and the sole `/gcdopt` dispatcher.
 
-## Timing data flow
+`GCDOptimizer_Util.lua` is the only low-level reader for restriction-sensitive GCD and attack-speed values. Detector, estimator, metrics, and HUD consume ordinary outputs from that boundary.
+
+## Data flow
 
 ```text
 C_Spell.GetSpellCooldown(61304)
-        │
-        ├── ordinary numeric fields ──────────────► Detector: DIRECT_EXACT
-        │                                              │
-        │                                              ▼
-        │                                            Metrics
-        │
-        └── Secret/unusable numeric fields
-                      │
-UnitAttackSpeed(player) ─► calibrated ratio ─► Estimator: ESTIMATED_SWING
-                      │                             ▲
-UNIT_SPELLCAST_SUCCEEDED ─► candidate timestamp ───┘
+  ├─ ordinary start/duration/modRate ─► DIRECT_EXACT
+  ├─ active flag + restricted numbers ─► candidate fallback gate
+  └─ inactive flag ────────────────────► reject off-GCD success
 
-secure action post-hooks ─► local press timestamps ─► Metrics ─► HUD
-Estimator ─► Integrator ──────────────────────────────────────► HUD
-player failure events ─► payload-free Failures ───────────────► HUD
-overlay glow events ─► bounded Anchors diagnostics
+UnitAttackSpeed(player)
+  + last direct GCD/swing pair ────────► ESTIMATED_SWING duration
+
+UNIT_SPELLCAST_SUCCEEDED
+  └─ local timestamp only
+     + confirmed active generic GCD ───► ESTIMATED_SWING start
+
+secure action post-hooks ──────────────► local press timestamps
+
+accepted starts + timestamps ─────────► Metrics
+  ├─ cadence (exact or explicitly estimated)
+  └─ exact input evidence only when:
+       previous source = DIRECT_EXACT
+       current source  = DIRECT_EXACT
+       candidate count = 1
+
+Metrics + Integrator + Failures ───────► HUD
 ```
 
-## Evidence classes
+## Observation classes
 
-### DIRECT_EXACT
+### `DIRECT_EXACT`
 
-Accessible `61304` start/duration values. These are the preferred source and can replace an event estimate for the same cycle.
+All timing fields are accessible, finite, positive, and normalized by `modRate`. This is the only authoritative start source.
 
-### ESTIMATED_SWING
+### `ESTIMATED_SWING`
 
-Direct numbers are unusable, but accessible attack-speed calibration and local event timing remain. This preserves functionality under the project's reported Midnight combat behavior. It is approximate and must be labeled.
+Direct numerical timing is unavailable, generic-GCD activity is confirmed, and a valid direct/swing calibration exists. It preserves approximate cadence but is excluded from exact latency/SQW evidence.
 
-### CACHED_LOW_CONFIDENCE
+### `CACHED_LOW_CONFIDENCE`
 
-Neither current direct timing nor swing speed can be used. The last stable duration may keep the UI coherent, but no exact start or latency claim may be manufactured.
+Only a last stable/default duration is available. It is display-only: no start, no possible-GCD integration, no latency claim.
 
-The current restored implementation does not yet attach these labels to every metric record; issue #5 owns that hardening.
+## Deduplication
 
-## Security boundary
-
-Both `C_Spell.GetSpellCooldown(61304)` and `UnitAttackSpeed("player")` are restriction-sensitive sources. A documented spell whitelist does not replace per-use accessibility checks. A successful `pcall` does not declassify data.
-
-Input hooks retain timestamps only. Failure tracking does not parse combat log or UI-error payloads. Transient spellcast payloads used by the fallback detector must not flow into SavedVariables or general feature state.
-
-## Known approximation risks
-
-- attack speed can diverge from GCD haste;
-- weapon swaps alter swing speed independently of haste;
-- a default `1.5` base GCD is wrong for some specs;
-- successful off-GCD actions can reach the fallback detector;
-- success-event timing differs among instant, cast-time, channelled, and empowered spells;
-- exact and estimated samples are not yet separated in recommendations.
+The detector delays event fallback briefly, deduplicates repeated direct starts, and upgrades a nearby estimated start when direct timing arrives later. Upgrade changes the source without adding a second observed GCD. Same-cycle source priority is monotonic (`DIRECT_EXACT` cannot be overwritten by `ESTIMATED_SWING`), and unchanged exact polls do not propagate redundant HUD refreshes.
 
 ## Lifecycle
 
-Core initializes modules once and starts/stops segment-scoped work. Detector and HUD timers must be cancelled on reset/end. Direct polling and event fallback must deduplicate the same GCD rather than creating two metric cycles.
+Detector and HUD timers are segment-scoped and cancelled before replacement and at segment end/reset. Estimator calibration survives ordinary segment resets but is invalidated by equipment or specialization changes.
+
+## Persistence
+
+Only user configuration is stored in `GCDOptimizerDB`. Transient timing, source labels, presses, events, and failures are never serialized.

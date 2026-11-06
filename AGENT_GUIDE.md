@@ -1,87 +1,48 @@
-# Agent guide: GCD Optimizer
+# Agent guide
 
-## Current contract
+## Target
 
-Target Retail `12.1.0`, Interface `120100`, addon version `0.5.0-midnight-12.1`. Blizzard source baseline: build `12.1.0.69497`, commit `027d26c3406d3de2cbd2b1f67d468fe033a1bcd4`.
+- Retail `12.1.5`
+- Interface `120105`
+- Addon `0.6.0-midnight-12.1.5`
+- Production slash-command owner: `GCDOptimizer_Core.lua`
+- Production load order: `GCDOptimizer.toc`
 
-Read before changing timing logic:
+Before changing timing/security behavior, read:
 
-- `README_MIDNIGHT.md`
-- `GCD_RUNTIME_EVIDENCE.md`
-- issue #5
-- the project knowledge base at `UnknownAlienHuman/wow-addon-engineering-kb`
+1. `GCD_OBSERVATION_CONTRACT.md`
+2. `GCD_RUNTIME_EVIDENCE.md`
+3. the current `wow-addon-engineering-kb` routes for spell secrecy, patch migration, lifecycle, persistence, and performance.
 
-## Non-negotiable historical fact
+## Non-negotiable invariants
 
-The original Midnight implementation contains an intentional `UnitAttackSpeed`-calibrated fallback because direct numerical GCD timing was reported or expected to become Secret in combat. Do **not** remove that fallback based only on a whitelist note, Wowhead flag, out-of-combat read, or another addon's implementation.
+1. Gate every restriction-sensitive return before comparison, branching, arithmetic, formatting, indexing, or persistence.
+2. `pcall` contains errors; it never makes Secret data ordinary.
+3. Do not add `C_Spell.DoesSpellTriggerGlobalCooldown`; it is absent from the selected generated API.
+4. `UNIT_SPELLCAST_SUCCEEDED` is a wake/candidate signal. An estimated start requires confirmed generic-GCD activity.
+5. Every accepted start carries one source: `DIRECT_EXACT` or `ESTIMATED_SWING`. Cached values never create starts, and source quality never decreases within a deduplicated cycle.
+6. Exact latency/SQW evidence requires an exact-to-exact cycle and exactly one eligible local press.
+7. Zero input candidates mean `unobserved_input`, not AFK. Multiple candidates mean `ambiguous_multi_press`; attribution never reaches back to the press that started the previous GCD.
+8. Weapon/spec changes invalidate swing calibration without erasing the last stable display duration.
+9. Tickers/timers have one owner, are bounded, and are cancelled before replacement and on teardown.
+10. Runtime behavior is not proven until the named-build matrix is run in game.
 
-The external record also says Blizzard intended `61304` to be non-secret. Treat this as an unresolved runtime discrepancy until a named-build/context matrix exists.
+## Verification
 
-## Runtime map
+Minimum source gate:
 
-- `GCDOptimizer_Core.lua`: composition root, DB migration, lifecycle, combat automation, HUD visibility, sole `/gcdopt` dispatcher.
-- `GCDOptimizer_GCDEstimator.lua`: direct duration first; attack-speed calibration, EWMA correction, and last-stable fallback.
-- `GCDOptimizer_GCDDetector.lua`: direct cooldown polling plus `UNIT_SPELLCAST_SUCCEEDED` candidate-start fallback.
-- `GCDOptimizer_PressTracker.lua`: action hooks; local timestamps only enter metrics.
-- `GCDOptimizer_Metrics.lua`: queue, late, idle, waste, loss, and SQW analysis.
-- `GCDOptimizer_Integrator.lua`: possible-GCD integration from the estimator.
-- `GCDOptimizer_Failures.lua`: payload-free failure timestamps.
-- `GCDOptimizer_Anchors.lua`: bounded overlay diagnostics.
-- `GCDOptimizer_HUD.lua`: presentation; no combat-data discovery.
-- `GCDOptimizer_Options.lua` / `GCDOptimizer_Minimap.lua`: settings and launcher adapters.
-
-## Observation classes
-
-Every future hardening pass must distinguish:
-
-- `DIRECT_EXACT`: accessible `61304` numerical start/duration;
-- `ESTIMATED_SWING`: duration derived from accessible attack-speed calibration and start inferred from non-secret event/activity evidence;
-- `CACHED_LOW_CONFIDENCE`: last stable duration only, with no fabricated exact start.
-
-Do not merge these classes into one undifferentiated metric stream.
-
-## Security invariants
-
-1. Gate every Secret-capable value before branch, comparison, arithmetic, formatting, indexing, logging, persistence, or forwarding.
-2. `pcall` is diagnostics/error containment, not declassification.
-3. Direct `61304` fields and `UnitAttackSpeed` are independent optional sources; either can become unusable.
-4. Never perform swing-ratio arithmetic unless both baseline and current values are ordinary accessible positive numbers.
-5. Do not bridge a blind interval as if it were exact evidence.
-6. Do not recover spell identity from protected frames, combat log, UI error text, target data, macro text, or timing side channels.
-7. Transient spell IDs from `UNIT_SPELLCAST_SUCCEEDED` may only support an explicitly allowed, accessibility-checked classifier and must not be persisted into metrics/SavedVariables.
-8. `C_Spell.DoesSpellTriggerGlobalCooldown` is absent from the pinned generated API contract; never assume it exists.
-
-## Correctness invariants
-
-- Direct cooldown starts override event estimates for the same cycle.
-- Off-GCD successes must not be counted as exact GCD starts.
-- Instant, cast-time, channelled, and empowered event orderings are different test cases.
-- One-second base-GCD specs must not inherit a silent `1.5` baseline.
-- Weapon swaps and attack-speed-only modifiers must invalidate or recalibrate swing-derived estimates.
-- Estimated/ambiguous samples must not drive exact latency or SpellQueueWindow recommendations.
-- Detector and HUD tickers must remain segment-scoped and cancellable.
-
-## SavedVariables
-
-Store compatible configuration only. Never persist raw combat samples or protected payloads. Schema changes require explicit migration; release-string changes must not erase user settings.
-
-## Static review
-
-```powershell
-rg -n "^## Interface|^## Version" GCDOptimizer.toc
-rg -n "SLASH_GCDOPT1|SlashCmdList[.\[]GCDOPT" .
-rg -n "UnitAttackSpeed|GetSpellCooldown\(.*61304|UNIT_SPELLCAST_SUCCEEDED" GCDOptimizer_*.lua
-rg -n "DoesSpellTriggerGlobalCooldown|COMBAT_LOG_EVENT_UNFILTERED|UI_ERROR_MESSAGE" GCDOptimizer_*.lua
-rg -n "GCDOptimizer_Test.lua" GCDOptimizer.toc
+```bash
+lua tests/test_runtime.lua
+lua tests/test_bootstrap.lua
 ```
 
-Expected:
+Also verify:
 
-- exactly one production `/gcdopt` dispatcher;
-- `UnitAttackSpeed` remains present in the estimator until issue #5 is resolved by runtime evidence;
-- all Secret-capable reads have explicit use boundaries;
-- no production test harness in the TOC.
+- no production duplicate `/gcdopt` owner;
+- test harness excluded from the TOC;
+- no raw combat-log/UI-error reason inference;
+- `Interface` and version metadata match the selected patch;
+- all modified Lua parses;
+- branch diff is reviewed before merge.
 
-## Live verification
-
-Follow `todo.md`, issue #1, and issue #5. Static Lua tests cannot resolve spell-data policy, taint context, or event ordering in the WoW client.
+Report source-test results separately from live-client results.

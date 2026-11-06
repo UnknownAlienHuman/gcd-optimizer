@@ -1,8 +1,8 @@
-## Interface: 120100
+## Interface: 120105
 ## Title: GCD Optimizer
-## Notes: GCD timing / press analysis (queue, late input, and server-delay symptoms)
+## Notes: Source-aware GCD cadence, queue, late-input, and server-delay analysis
 ## Author: Neomorph
-## Version: 0.5.0-midnight-12.1
+## Version: 0.6.0-midnight-12.1.5
 ## SavedVariables: GCDOptimizerDB
 ## OptionalDeps: LibStub, CallbackHandler-1.0, LibDataBroker-1.1, LibDBIcon-1.0
 ## IconTexture: Interface\Icons\INV_Misc_PocketWatch_02

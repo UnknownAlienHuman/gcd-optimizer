@@ -1,5 +1,6 @@
 -- GCDOptimizer_Util.lua
--- Shared helpers, bounded deque, statistics, and the Secret-safe cooldown boundary.
+-- Shared numeric helpers, bounded deque/statistics, and the single
+-- Secret-aware boundary for GCD and attack-speed observations.
 
 local _, NS = ...
 
@@ -8,14 +9,30 @@ local U = NS.Util
 
 U.GCD_SPELL_ID = 61304
 
-function U.Clamp(x, lo, hi)
-  if x < lo then return lo end
-  if x > hi then return hi end
-  return x
+U.GCD_STATUS_EXACT = "DIRECT_EXACT"
+U.GCD_STATUS_ACTIVE_RESTRICTED = "ACTIVE_RESTRICTED"
+U.GCD_STATUS_INACTIVE = "INACTIVE"
+U.GCD_STATUS_UNAVAILABLE = "UNAVAILABLE"
+U.GCD_STATUS_MALFORMED = "MALFORMED"
+
+U.GCD_SOURCE_DIRECT = "DIRECT_EXACT"
+U.GCD_SOURCE_ESTIMATED = "ESTIMATED_SWING"
+U.GCD_SOURCE_CACHED = "CACHED_LOW_CONFIDENCE"
+
+function U.Clamp(value, minimum, maximum)
+  if value < minimum then return minimum end
+  if value > maximum then return maximum end
+  return value
 end
 
--- Test accessibility before any branch, comparison, arithmetic, formatting,
--- indexing, or persistence of a value returned by a Secret-capable API.
+function U.IsFiniteNumber(value)
+  return type(value) == "number"
+    and value == value
+    and value ~= math.huge
+    and value ~= -math.huge
+end
+
+-- Gate Secret-capable values before every Lua operation that consumes them.
 function U.CanAccessValues(...)
   if type(canaccessallvalues) == "function" then
     return canaccessallvalues(...)
@@ -23,8 +40,8 @@ function U.CanAccessValues(...)
 
   local count = select("#", ...)
   if type(canaccessvalue) == "function" then
-    for i = 1, count do
-      if not canaccessvalue(select(i, ...)) then
+    for index = 1, count do
+      if not canaccessvalue(select(index, ...)) then
         return false
       end
     end
@@ -32,8 +49,8 @@ function U.CanAccessValues(...)
   end
 
   if type(issecretvalue) == "function" then
-    for i = 1, count do
-      if issecretvalue(select(i, ...)) then
+    for index = 1, count do
+      if issecretvalue(select(index, ...)) then
         return false
       end
     end
@@ -42,41 +59,91 @@ function U.CanAccessValues(...)
   return true
 end
 
--- Returns ordinary numeric startTime/duration values only. Inaccessible,
--- missing, inactive, and malformed cooldowns all collapse to nil, nil.
-function U.ReadSpellCooldown(spellID)
-  if type(spellID) ~= "number" or spellID <= 0 then
-    return nil, nil
+function U.CanAccessTable(value)
+  if not U.CanAccessValues(value) then return false end
+  if type(value) ~= "table" then return false end
+  if type(canaccesstable) == "function" and not canaccesstable(value) then
+    return false
   end
+  return true
+end
+
+local function ReadField(info, key)
+  -- pcall contains a denied field access; it does not declassify the value.
+  local ok, value = pcall(function() return info[key] end)
+  if not ok or not U.CanAccessValues(value) then
+    return false, nil
+  end
+  return true, value
+end
+
+-- Returns:
+--   status, startTime, wallDuration, rawDuration, modRate
+-- Numeric timing is returned only for DIRECT_EXACT. isActive is NeverSecret in
+-- the selected generated contract and lets the detector reject off-GCD success
+-- events even when the numerical fields are restricted.
+function U.ReadGCDObservation()
   if type(C_Spell) ~= "table" or type(C_Spell.GetSpellCooldown) ~= "function" then
-    return nil, nil
+    return U.GCD_STATUS_UNAVAILABLE
   end
 
-  local info = C_Spell.GetSpellCooldown(spellID)
-  if not U.CanAccessValues(info) then
-    return nil, nil
+  local ok, info = pcall(C_Spell.GetSpellCooldown, U.GCD_SPELL_ID)
+  if not ok then
+    return U.GCD_STATUS_UNAVAILABLE
   end
-  if type(info) ~= "table" then
-    return nil, nil
-  end
-
-  local startTime = info.startTime
-  local duration = info.duration
-  if not U.CanAccessValues(startTime, duration) then
-    return nil, nil
-  end
-  if type(startTime) ~= "number" or type(duration) ~= "number" then
-    return nil, nil
-  end
-  if startTime <= 0 or duration <= 0 then
-    return nil, nil
+  if not U.CanAccessTable(info) then
+    return U.GCD_STATUS_UNAVAILABLE
   end
 
+  local activeReadable, isActive = ReadField(info, "isActive")
+  if activeReadable then
+    if type(isActive) ~= "boolean" then
+      return U.GCD_STATUS_MALFORMED
+    end
+    if not isActive then
+      return U.GCD_STATUS_INACTIVE
+    end
+  end
+
+  local startReadable, startTime = ReadField(info, "startTime")
+  local durationReadable, rawDuration = ReadField(info, "duration")
+  local rateReadable, modRate = ReadField(info, "modRate")
+  if not (startReadable and durationReadable and rateReadable) then
+    return activeReadable and U.GCD_STATUS_ACTIVE_RESTRICTED or U.GCD_STATUS_UNAVAILABLE
+  end
+
+  if not U.IsFiniteNumber(startTime)
+    or not U.IsFiniteNumber(rawDuration)
+    or not U.IsFiniteNumber(modRate)
+    or startTime <= 0
+    or rawDuration <= 0
+    or modRate <= 0
+  then
+    return U.GCD_STATUS_MALFORMED
+  end
+
+  local wallDuration = rawDuration / modRate
+  if not U.IsFiniteNumber(wallDuration) or wallDuration <= 0 then
+    return U.GCD_STATUS_MALFORMED
+  end
+
+  return U.GCD_STATUS_EXACT, startTime, wallDuration, rawDuration, modRate
+end
+
+-- Compatibility helper for callers that only need exact ordinary timing.
+function U.ReadGCDCooldown()
+  local status, startTime, duration = U.ReadGCDObservation()
+  if status ~= U.GCD_STATUS_EXACT then return nil, nil end
   return startTime, duration
 end
 
-function U.ReadGCDCooldown()
-  return U.ReadSpellCooldown(U.GCD_SPELL_ID)
+function U.ReadPlayerAttackSpeed()
+  if type(UnitAttackSpeed) ~= "function" then return nil end
+
+  local ok, mainHand = pcall(UnitAttackSpeed, "player")
+  if not ok or not U.CanAccessValues(mainHand) then return nil end
+  if not U.IsFiniteNumber(mainHand) or mainHand <= 0 then return nil end
+  return mainHand
 end
 
 -- ----------------------------
@@ -98,15 +165,15 @@ function U.Deque:MaybeCompact()
   end
 
   if head > (size * 2) then
-    local new = {}
-    local j = 1
-    for i = head, tail do
-      new[j] = self.data[i]
-      j = j + 1
+    local compact = {}
+    local target = 1
+    for index = head, tail do
+      compact[target] = self.data[index]
+      target = target + 1
     end
-    self.data = new
+    self.data = compact
     self.head = 1
-    self.tail = j - 1
+    self.tail = target - 1
   end
 end
 
@@ -118,10 +185,14 @@ function U.Deque:Size()
   return self.tail - self.head + 1
 end
 
-function U.Deque:PushBack(v)
-  local tail = self.tail + 1
-  self.tail = tail
-  self.data[tail] = v
+function U.Deque:PushBack(value)
+  self.tail = self.tail + 1
+  self.data[self.tail] = value
+end
+
+function U.Deque:Back()
+  if self.head > self.tail then return nil end
+  return self.data[self.tail]
 end
 
 function U.Deque:Front()
@@ -147,11 +218,11 @@ function U.Deque:PopFrontWhile(predicate)
 end
 
 function U.Deque:Iter()
-  local i = self.head - 1
+  local index = self.head - 1
   return function()
-    i = i + 1
-    if i <= self.tail then
-      return self.data[i]
+    index = index + 1
+    if index <= self.tail then
+      return self.data[index]
     end
   end
 end
@@ -161,7 +232,7 @@ end
 -- ----------------------------
 local function CopyAndSort(values)
   local copy = {}
-  for i = 1, #values do copy[i] = values[i] end
+  for index = 1, #values do copy[index] = values[index] end
   table.sort(copy)
   return copy
 end
@@ -170,7 +241,7 @@ function U.Mean(values)
   local count = #values
   if count == 0 then return 0 end
   local total = 0
-  for i = 1, count do total = total + values[i] end
+  for index = 1, count do total = total + values[index] end
   return total / count
 end
 
@@ -178,11 +249,9 @@ function U.Median(values)
   local count = #values
   if count == 0 then return 0 end
   local sorted = CopyAndSort(values)
-  local mid = math.floor((count + 1) / 2)
-  if (count % 2) == 1 then
-    return sorted[mid]
-  end
-  return (sorted[mid] + sorted[mid + 1]) / 2
+  local middle = math.floor((count + 1) / 2)
+  if (count % 2) == 1 then return sorted[middle] end
+  return (sorted[middle] + sorted[middle + 1]) / 2
 end
 
 function U.Percentile(values, percentile)

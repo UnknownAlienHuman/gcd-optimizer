@@ -1,48 +1,49 @@
 # GCD Optimizer — release checklist
 
-## Preserved 12.1 work
+## Source hardening completed
 
-- [x] Target Retail 12.1.0 / Interface `120100`.
-- [x] Initialize `GCDOptimizer_GCDDetector` from Core.
-- [x] Keep one production `/gcdopt` dispatcher.
-- [x] Preserve compatible SavedVariables through schema migration.
-- [x] Keep press hooks timestamp-only.
-- [x] Remove combat-log and raw UI-error failure inference.
-- [x] Remove obsolete `GetMouseFocus` use.
-- [x] Keep detector/HUD work segment-scoped.
+- [x] Target Retail 12.1.5 / Interface `120105`.
+- [x] Centralize `61304` and `UnitAttackSpeed` accessibility checks.
+- [x] Normalize direct duration by `modRate`.
+- [x] Preserve calibration across segment resets.
+- [x] Invalidate calibration on equipment/spec changes.
+- [x] Calibrate one-second profiles from direct evidence; no class hardcoding.
+- [x] Label `DIRECT_EXACT`, `ESTIMATED_SWING`, and `CACHED_LOW_CONFIDENCE`.
+- [x] Require confirmed generic-GCD activity for event fallback.
+- [x] Remove the nonexistent `C_Spell.DoesSpellTriggerGlobalCooldown` path.
+- [x] Upgrade a nearby estimate when later direct timing arrives.
+- [x] Prevent lower-quality same-cycle data from overwriting exact timing.
+- [x] Suppress unchanged exact-poll refresh spam.
+- [x] Treat zero press candidates as unobserved and multiple as ambiguous.
+- [x] Exclude estimated, unobserved, and ambiguous samples from exact latency/SQW evidence.
+- [x] Stop using missing press hooks as proof of AFK.
+- [x] Prevent oversized SQW attribution from reaching the previous GCD-start press.
+- [x] Guard SpellQueueWindow changes during combat lockdown.
+- [x] Cancel detector/HUD timers before replacement and teardown.
+- [x] Add deterministic tests for secrecy states, one-second calibration, attribution, off-GCD rejection, transitions, and dedupe.
 
-## Regression repair
+## Static/source gate
 
-- [x] Restore the known `baseSwing/currentSwing` GCD estimator.
-- [x] Restore the event-derived candidate-start fallback.
-- [x] Remove the pending direct-only migration workflow/script.
-- [x] Correct direct-only documentation.
+- [x] Lua syntax check for modified production/test files.
+- [x] `lua tests/test_runtime.lua`.
+- [x] `lua tests/test_bootstrap.lua`.
+- [x] One production `/gcdopt` owner.
+- [x] Developer harness excluded from the TOC.
+- [x] No combat-log/raw UI-error failure inference.
 
-## Required hardening
+## Current-client release gate — NOT-RUN
 
-- [ ] Centralize accessibility checks for both `61304` numeric fields and `UnitAttackSpeed` without removing either source.
-- [ ] Preserve swing calibration across reset/start boundaries correctly.
-- [ ] Detect weapon swaps and attack-speed-only modifiers; recalibrate or downgrade confidence.
-- [ ] Calibrate one-second base-GCD specs rather than silently using `1.5`.
-- [ ] Distinguish `DIRECT_EXACT`, `ESTIMATED_SWING`, and `CACHED_LOW_CONFIDENCE` in metric records and HUD/debug output.
-- [ ] Prevent off-GCD `UNIT_SPELLCAST_SUCCEEDED` events from becoming exact GCD cycles.
-- [ ] Validate instant, cast-time, channelled, and empowered event timing separately.
-- [ ] Exclude estimated and ambiguous samples from exact latency/SQW recommendations.
-- [ ] Add deterministic tests for direct-to-estimated transitions and duplicate suppression.
+Record exact version/build/Interface/date/spec/content/restriction/taint state.
 
-## Current-client release gate
+- [ ] Outside combat probe.
+- [ ] Open-world combat probe.
+- [ ] Encounter and Mythic+ probe.
+- [ ] Arena and battleground probe.
+- [ ] `SPELL_SECRECY_CHANGED` transition.
+- [ ] Ordinary and one-second profiles.
+- [ ] Weapon swaps, haste changes, and attack-speed-only effects.
+- [ ] Instant, cast-time, channelled, empowered, item, macro, and mixed off-GCD actions.
+- [ ] Manual timeline comparison for exact/estimated starts.
+- [ ] Login, `/reload`, controls, minimap, persistence, ticker cleanup, Lua/taint errors.
 
-Record exact version, build, Interface, date, content type, restriction state, and taint state.
-
-- [ ] Outside combat: probe `61304` policy and numeric accessibility.
-- [ ] Open-world combat: repeat the probe and capture attack-speed accessibility.
-- [ ] Encounter and Mythic+: repeat.
-- [ ] Arena and battleground: repeat.
-- [ ] Trigger/observe `SPELL_SECRECY_CHANGED`.
-- [ ] Test ordinary and one-second-GCD specs.
-- [ ] Test weapon swaps, haste changes, and attack-speed-only effects.
-- [ ] Mix off-GCD actions into every rotation.
-- [ ] Compare exact/estimated cycle counts against a recorded manual timeline.
-- [ ] Verify login, `/reload`, controls, minimap, persistence, ticker cleanup, and no Lua/taint errors.
-
-Issues #1 and #5 are release blockers. Do not package a release until both evidence and behavior are resolved.
+Issues #1 and #5 remain live-client gates. Do not package a public release until this matrix is recorded.
